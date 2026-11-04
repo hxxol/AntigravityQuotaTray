@@ -1,6 +1,6 @@
 # 修改说明（相对原版 CodexQuotaTray 3.0.2-preview）
 
-本仓库由 [hxxol/CodexQuotaTray](https://github.com/hxxol/CodexQuotaTray) 改成 Claude 版。界面和逻辑尽量保持原样，只改了下面这些地方。当前最新版本：v1.0.5。
+本仓库由 [hxxol/CodexQuotaTray](https://github.com/hxxol/CodexQuotaTray) 改成 Claude 版。界面和逻辑尽量保持原样，只改了下面这些地方。当前最新版本：v1.0.6。
 
 ## 1. 额度来源：Codex 改为 Claude
 
@@ -37,6 +37,20 @@
   - 等待期间悬停提示显示“令牌已过期，运行一次 claude -p "hi" 即可续期”。运行任意一次 `claude` 命令即可续期，程序在 1 分钟内读到新令牌。
   - 等待期间只读本地文件、不发网络请求，所以轮询间隔保持 60 秒，不翻倍。
 - 设置和日志目录：`settings.ini` 和 `logs\runtime.log` 从 `%LOCALAPPDATA%\CodexMeter` 改为 `%LOCALAPPDATA%\ClaudeMeter`，不再与原版 CodexQuotaTray 共用（原来两个程序会互相覆盖缓存的剩余额度）。首次启动时会复制原来的设置，但不复制缓存的剩余额度。
+
+## 8. 圆环改为显示 5 小时额度，周额度移到悬停提示（v1.0.6）
+
+文件：`src/QuotaDisplayState.cs`、`src/TaskbarWidgetForm.cs`、`src/TrayApplicationContext.cs`、`tests/RegressionTests.cs`
+
+- 任务栏圆环、系统托盘图标、悬浮窗的圆环和中间数字，原来显示剩余最少的窗口（通常是每周额度），现在固定显示 5 小时窗口的剩余额度。
+- 悬停提示在两行重置时间上方新增一行周额度剩余百分比，例如：
+  ```
+  周额度：72%
+  5h额度：X天X时X分后重置
+  周额度：X天X时X分后重置
+  ```
+  任务栏圆环和悬浮窗的提示框每行居中；系统托盘原生提示只能左对齐，用空格近似居中。
+- 升级后第一次读取成功前，圆环仍显示上一版缓存的数值（每周额度），读取成功后即变为 5 小时额度。
 
 ## 2. 悬停提示改为两行
 

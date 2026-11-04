@@ -55,22 +55,20 @@ internal static class RegressionTests
         var second = new QuotaWindow { UsedPercent = 60, WindowMinutes = 10080 };
         snapshot.Windows.Add(first); snapshot.Windows.Add(second);
         var offline = new QuotaReadResult { IsCodexRunning = false, Snapshot = snapshot };
+        first.Kind = QuotaWindowKind.FiveHour; second.Kind = QuotaWindowKind.Weekly;
         var fallback = QuotaDisplayState.Update(offline, settings);
-        Assert(fallback.Known && fallback.Remaining == 40 && fallback.ResetWindow == null, "First offline snapshot can seed display but no stale tooltip.");
+        Assert(fallback.Known && fallback.Remaining == 70 && fallback.ResetWindow == null, "First offline snapshot can seed display but no stale tooltip.");
         settings.LastRemainingPercent = 67;
         var kept = QuotaDisplayState.Update(offline, settings);
         Assert(kept.Remaining == 67 && !kept.CacheChanged, "Offline snapshots must not overwrite last successful display.");
         offline.IsCodexRunning = true;
         var live = QuotaDisplayState.Update(offline, settings);
-        Assert(live.Remaining == 40 && live.ResetWindow == second && live.CacheChanged, "Live display must use most constrained window.");
-        first.UsedPercent = second.UsedPercent;
-        Assert(QuotaDisplayState.Update(offline, settings).ResetWindow == first, "Equal minima retain original input order.");
+        Assert(live.Remaining == 70 && live.ResetWindow == first && live.CacheChanged, "Live display must use the 5-hour window, not the weekly one.");
+        first.UsedPercent = 10;
+        Assert(QuotaDisplayState.Update(offline, settings).Remaining == 90, "Display follows the 5-hour window even when weekly is lower.");
         snapshot.ReserveWindow = new QuotaWindow { UsedPercent = 15, WindowMinutes = 10080 };
-        Assert(QuotaDisplayState.Update(offline, settings).Remaining == 85, "Used reserve bucket must win over exhausted normal quota.");
-        snapshot.ReserveWindow.UsedPercent = 0;
-        snapshot.OrdinaryUsageAllowed = false;
-        Assert(QuotaDisplayState.Update(offline, settings).Remaining == 100, "Disallowed normal usage must select untouched reserve too.");
-        Assert(QuotaDisplayState.Update(new QuotaReadResult(), settings).Remaining == 100, "Failed refresh keeps cache.");
+        Assert(QuotaDisplayState.Update(offline, settings).Remaining == 90, "Reserve bucket must not replace the 5-hour display.");
+        Assert(QuotaDisplayState.Update(new QuotaReadResult(), settings).Remaining == 90, "Failed refresh keeps cache.");
     }
     private static void SettingsRoundTrip()
     {

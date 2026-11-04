@@ -159,7 +159,7 @@ namespace CodexQuotaTray
 
         private void UpdateTrayTooltip()
         {
-            var text = BuildResetText();
+            var text = CenterWeeklyLine(BuildResetText());
             // NotifyIcon rejects tooltips longer than 127 characters.
             if (text.Length > 127) text = text.Substring(0, 127);
             if (_recoveryIcon.Text != text) _recoveryIcon.Text = text;
@@ -168,14 +168,31 @@ namespace CodexQuotaTray
         private string BuildResetText()
         {
             var snapshot = _lastResult != null && _lastResult.Snapshot != null ? _lastResult.Snapshot : _lastGoodSnapshot;
-            var text = FormatTrayReset("5h额度", snapshot == null ? null : snapshot.FiveHourWindow) + "\n" +
-                FormatTrayReset("周额度", snapshot == null ? null : snapshot.WeeklyWindow);
+            var weekly = snapshot == null ? null : snapshot.WeeklyWindow;
+            var text = (weekly == null ? "周额度：暂无数据" : "周额度：" + weekly.RemainingPercent.ToString(CultureInfo.InvariantCulture) + "%") + "\n" +
+                FormatTrayReset("5h额度", snapshot == null ? null : snapshot.FiveHourWindow) + "\n" +
+                FormatTrayReset("周额度", weekly);
             if (_lastError == null) return text;
             var header = _lastGoodSnapshot == null
                 ? "未能读取额度"
                 : "额度未更新，显示的是 " + _lastGoodSnapshot.CapturedAt.ToLocalTime().ToString("MM-dd HH:mm", CultureInfo.InvariantCulture) + " 的数据";
             var reason = _lastError.Length > 40 ? _lastError.Substring(0, 40) + "…" : _lastError;
             return header + "\n" + reason + "\n" + text;
+        }
+
+        // The native system-tray tooltip is left-aligned, so pad the weekly line with spaces to
+        // roughly center it over the longest line. The custom tooltips center every line themselves.
+        private static string CenterWeeklyLine(string text)
+        {
+            var lines = text.Split('\n');
+            var index = Array.FindIndex(lines, line => line.StartsWith("周额度：", StringComparison.Ordinal) && !line.EndsWith("重置", StringComparison.Ordinal));
+            if (index < 0) return text;
+            // Measure in half-width units: CJK characters are about twice as wide as a space.
+            Func<string, int> width = line => line.Sum(ch => ch > 0x2E80 ? 2 : 1);
+            var widest = lines.Max(width);
+            var pad = (widest - width(lines[index])) / 2;
+            if (pad > 0) lines[index] = new string(' ', pad) + lines[index];
+            return string.Join("\n", lines);
         }
 
         private static string FormatTrayReset(string label, QuotaWindow window)
