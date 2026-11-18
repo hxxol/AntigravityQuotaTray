@@ -5,28 +5,48 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
+using System.Runtime.InteropServices;
 using System.Text;
-using System.Text.Json.Nodes;
 using CodexQuotaTray.Compatibility;
 
 namespace CodexQuotaTray
 {
+    internal sealed class LanguageServerCandidate
+    {
+        public uint Pid { get; set; }
+        public string CsrfToken { get; set; }
+        public bool EnableLsp { get; set; }
+        public List<ushort> Ports { get; set; } = new List<ushort>();
+    }
+
     internal sealed class SessionQuotaReader
     {
-        private const int MaximumFilesToInspect = 24;
-        private const int MaximumActivityFiles = 300;
+        internal const string NotRunningMessage = "Antigravity 未运行";
+        internal const string UnreadableProcessMessage = "无法读取 Antigravity 服务参数（请保持相同运行权限）";
+        private const string ServicePath = "/exa.language_server_pb.LanguageServerService/";
+        private const string UserStatusRequestBody = "{\"metadata\":{\"ideName\":\"antigravity\",\"extensionName\":\"antigravity\",\"locale\":\"en\"}}";
+        private const int MaxPortsPerProcess = 6;
+        private const int MaximumCommandLineChars = 32768;
         private const int TailBytes = 768 * 1024;
+
+        private static readonly string[] LanguageServerExeNames =
+        {
+            "language_server_windows_x64.exe",
+            "language_server_windows_arm.exe",
+            "language_server_windows_arm64.exe",
+            "language_server_windows.exe"
+        };
+
+        private static readonly HttpClient LoopbackHttpClient = CreateLoopbackHttpClient();
+
         private readonly string _codexHome;
         private readonly Func<bool> _processDetector;
         private readonly string _liveQuotaHistoryPath;
-        private List<TokenActivitySample> _activityCache;
-        private List<TokenActivitySample> _activityTimelineCache;
         private List<QuotaUsageSample> _quotaHistoryCache;
         private List<QuotaUsageSample> _liveQuotaHistory;
-        private DateTimeOffset _activityCacheExpiresAt;
 
         public SessionQuotaReader()
-            : this(ResolveCodexHome(), IsClaudeLoggedIn)
+            : this(null, null)
         {
         }
 
@@ -36,32 +56,27 @@ namespace CodexQuotaTray
             _processDetector = processDetector;
             _liveQuotaHistoryPath = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "ClaudeMeter", "quota-history-v1.tsv");
+                "AntigravityMeter", "quota-history-v1.tsv");
         }
 
         public QuotaReadResult ReadLatest()
         {
-            var result = new QuotaReadResult
-            {
-                IsCodexRunning = _processDetector()
-            };
+            var result = new QuotaReadResult();
 
             try
             {
-                // Claude: read the OAuth usage endpoint with the Claude Code credentials.
+                bool running;
+                bool keepNormalPace;
                 string failure;
-                bool refreshed;
-                var latest = ReadLatestFromClaudeApi(out failure, out refreshed);
-                result.TokenRefreshed = refreshed;
+                var latest = ReadLatestFromLocalLanguageServer(out running, out keepNormalPace, out failure);
+                result.IsCodexRunning = _processDetector != null ? _processDetector() : running;
                 result.Snapshot = latest;
-                result.Activity = new List<TokenActivitySample>();
-                result.ActivityTimeline = new List<TokenActivitySample>();
+                result.KeepNormalPollInterval = keepNormalPace;
                 if (latest != null) RecordLiveQuotaSnapshot(latest);
                 result.QuotaHistory = GetCombinedQuotaHistory();
                 if (latest == null)
                 {
                     result.Error = failure ?? "读取额度时出现未知错误";
-                    result.AwaitingTokenRenewal = failure == AwaitingClaudeRenewalMessage;
                 }
             }
             catch (Exception)
@@ -71,6 +86,834 @@ namespace CodexQuotaTray
 
             return result;
         }
+
+        private static HttpClient CreateLoopbackHttpClient()
+        {
+            var handler = new SocketsHttpHandler
+            {
+                UseProxy = false,
+                AllowAutoRedirect = false,
+                ConnectTimeout = TimeSpan.FromSeconds(2),
+                PooledConnectionLifetime = TimeSpan.FromMinutes(2)
+            };
+            // Every URI passed to LoopbackHttpClient is built from 127.0.0.1 in BuildLoopbackRpcUri;
+            // the local Antigravity language server uses a self-signed localhost certificate.
+            handler.SslOptions.RemoteCertificateValidationCallback = (sender, certificate, chain, errors) => true;
+            return new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(4) };
+        }
+
+        private static Uri BuildLoopbackRpcUri(bool useHttps, ushort port, string rpcMethod)
+        {
+            return new Uri((useHttps ? "https://127.0.0.1:" : "http://127.0.0.1:") +
+                port.ToString(CultureInfo.InvariantCulture) + ServicePath + rpcMethod);
+        }
+
+        private static QuotaSnapshot ReadLatestFromLocalLanguageServer(
+            out bool isRunning,
+            out bool keepNormalPace,
+            out string failure)
+        {
+            isRunning = false;
+            keepNormalPace = false;
+            failure = null;
+
+            bool unreadableFound;
+            var candidates = DiscoverLanguageServers(out unreadableFound);
+            if (candidates.Count == 0)
+            {
+                if (unreadableFound)
+                {
+                    failure = UnreadableProcessMessage;
+                    return null;
+                }
+                keepNormalPace = true;
+                failure = NotRunningMessage;
+                return null;
+            }
+
+            isRunning = true;
+            SortLanguageServerCandidates(candidates);
+
+            bool anyPortFound = false;
+            bool unsupportedSummary = false;
+            string lastError = null;
+
+            foreach (var candidate in candidates)
+            {
+                var portCount = Math.Min(candidate.Ports.Count, MaxPortsPerProcess);
+                for (int i = 0; i < portCount; i++)
+                {
+                    anyPortFound = true;
+                    var port = candidate.Ports[i];
+                    QuotaSnapshot snapshot;
+                    bool methodMissing;
+                    string portError;
+                    if (TryQueryCandidatePort(port, candidate.CsrfToken, out snapshot, out methodMissing, out portError))
+                    {
+                        return snapshot;
+                    }
+                    if (methodMissing) unsupportedSummary = true;
+                    if (!string.IsNullOrWhiteSpace(portError)) lastError = portError;
+                }
+            }
+
+            if (!anyPortFound)
+            {
+                keepNormalPace = true;
+                failure = "Antigravity 正在启动，暂未监听本地端口";
+                return null;
+            }
+
+            failure = unsupportedSummary
+                ? "当前 Antigravity 版本不支持本地额度汇总接口"
+                : (lastError ?? "无法从本地 Antigravity 服务读取额度");
+            return null;
+        }
+
+        private static bool TryQueryCandidatePort(
+            ushort port,
+            string csrfToken,
+            out QuotaSnapshot snapshot,
+            out bool methodMissing,
+            out string error)
+        {
+            snapshot = null;
+            methodMissing = false;
+            error = null;
+
+            foreach (var useHttps in new[] { true, false })
+            {
+                int status;
+                string body;
+                if (!TryPostLoopbackRpc(useHttps, port, csrfToken, "RetrieveUserQuotaSummary", "{}", out status, out body))
+                {
+                    continue;
+                }
+
+                if (status >= 200 && status < 300)
+                {
+                    if (TryParseAntigravityQuotaSummary(body, out snapshot)) return true;
+                    error = "Antigravity 返回的额度数据无法识别";
+                    return false;
+                }
+
+                if (status == 404 || status == 501)
+                {
+                    int fallbackStatus;
+                    string fallbackBody;
+                    if (TryPostLoopbackRpc(useHttps, port, csrfToken, "GetUserStatus", UserStatusRequestBody, out fallbackStatus, out fallbackBody) &&
+                        fallbackStatus >= 200 && fallbackStatus < 300 &&
+                        TryParseAntigravityUserStatusFallback(fallbackBody, out snapshot))
+                    {
+                        return true;
+                    }
+                    methodMissing = true;
+                    return false;
+                }
+
+                error = status == 401 || status == 403
+                    ? "Antigravity 本地服务未登录或令牌未就绪"
+                    : "Antigravity 本地服务返回错误 (" + status.ToString(CultureInfo.InvariantCulture) + ")";
+                return false;
+            }
+
+            return false;
+        }
+
+        private static bool TryPostLoopbackRpc(
+            bool useHttps,
+            ushort port,
+            string csrfToken,
+            string rpcMethod,
+            string jsonBody,
+            out int statusCode,
+            out string responseBody)
+        {
+            statusCode = 0;
+            responseBody = null;
+            try
+            {
+                using (var request = new HttpRequestMessage(HttpMethod.Post, BuildLoopbackRpcUri(useHttps, port, rpcMethod)))
+                {
+                    request.Headers.TryAddWithoutValidation("Connect-Protocol-Version", "1");
+                    request.Headers.TryAddWithoutValidation("X-Codeium-Csrf-Token", csrfToken);
+                    request.Content = new StringContent(jsonBody, Encoding.UTF8, "application/json");
+                    using (var response = LoopbackHttpClient.SendAsync(request).GetAwaiter().GetResult())
+                    {
+                        statusCode = (int)response.StatusCode;
+                        responseBody = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+                        return true;
+                    }
+                }
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        internal static bool TryParseAntigravityQuotaSummary(string json, out QuotaSnapshot snapshot)
+        {
+            snapshot = null;
+            if (string.IsNullOrWhiteSpace(json)) return false;
+
+            try
+            {
+                var serializer = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
+                var root = serializer.DeserializeObject(json) as Dictionary<string, object>;
+                if (root == null) return false;
+
+                var response = AsDictionary(Get(root, "response")) ?? root;
+                var groups = Get(response, "groups") as System.Collections.IEnumerable;
+                if (groups == null || groups is string) return false;
+
+                var parsed = new QuotaSnapshot
+                {
+                    CapturedAt = DateTimeOffset.Now,
+                    LimitId = "antigravity"
+                };
+
+                foreach (var groupItem in groups)
+                {
+                    var group = AsDictionary(groupItem);
+                    if (group == null) continue;
+                    var groupDisplayName = AsString(Get(group, "displayName", "name")) ?? string.Empty;
+                    var buckets = Get(group, "buckets") as System.Collections.IEnumerable;
+                    if (buckets == null || buckets is string) continue;
+
+                    foreach (var bucketItem in buckets)
+                    {
+                        var bucket = AsDictionary(bucketItem);
+                        if (bucket == null) continue;
+
+                        bool disabled;
+                        if (TryBool(Get(bucket, "disabled"), out disabled) && disabled) continue;
+
+                        double remainingFraction;
+                        if (!TryDouble(Get(bucket, "remainingFraction", "remaining_fraction"), out remainingFraction)) continue;
+                        if (double.IsNaN(remainingFraction) || double.IsInfinity(remainingFraction) ||
+                            remainingFraction < 0d || remainingFraction > 1d)
+                        {
+                            continue;
+                        }
+
+                        var bucketId = AsString(Get(bucket, "bucketId", "id")) ?? string.Empty;
+                        var windowName = AsString(Get(bucket, "window")) ?? string.Empty;
+                        var pool = ClassifyPool(bucketId, groupDisplayName);
+                        var minutes = ParseAntigravityWindowMinutes(windowName, bucketId);
+                        var kind = ClassifyWindow(minutes);
+                        if (pool == QuotaPoolKind.Default || kind == QuotaWindowKind.Other) continue;
+                        if (parsed.FindPoolWindow(pool, kind) != null) continue;
+
+                        var untouchedFull = remainingFraction >= 1.0d;
+                        DateTimeOffset? resetTime = null;
+                        // At remainingFraction == 1, resetTime is a sliding placeholder rather than a real deadline.
+                        if (!untouchedFull)
+                        {
+                            var parsedReset = ParseTimestamp(Get(bucket, "resetTime", "reset_time"));
+                            if (parsedReset != DateTimeOffset.MinValue) resetTime = parsedReset;
+                        }
+
+                        var poolPrefix = pool == QuotaPoolKind.Gemini ? "gemini" : "thirdparty";
+                        parsed.Windows.Add(new QuotaWindow
+                        {
+                            Pool = pool,
+                            Name = (pool == QuotaPoolKind.Gemini ? "Gemini" : "第三方") + " · " + (kind == QuotaWindowKind.FiveHour ? "5h" : "Weekly"),
+                            Key = poolPrefix + ":" + minutes.ToString(CultureInfo.InvariantCulture),
+                            Kind = kind,
+                            WindowMinutes = minutes,
+                            UsedPercent = Math.Max(0d, Math.Min(100d, (1.0d - remainingFraction) * 100.0d)),
+                            ResetsAt = resetTime,
+                            IsUntouchedFull = untouchedFull
+                        });
+                    }
+                }
+
+                if (parsed.Windows.Count == 0) return false;
+                snapshot = parsed;
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        internal static bool TryParseAntigravityUserStatusFallback(string json, out QuotaSnapshot snapshot)
+        {
+            snapshot = null;
+            if (string.IsNullOrWhiteSpace(json)) return false;
+
+            try
+            {
+                var serializer = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
+                var root = serializer.DeserializeObject(json) as Dictionary<string, object>;
+                var userStatus = AsDictionary(Get(root, "userStatus"));
+                var cascade = AsDictionary(Get(userStatus, "cascadeModelConfigData"));
+                var configs = Get(cascade, "clientModelConfigs") as System.Collections.IEnumerable;
+                if (configs == null || configs is string) return false;
+
+                QuotaWindow gemini = null;
+                QuotaWindow thirdParty = null;
+
+                foreach (var item in configs)
+                {
+                    var config = AsDictionary(item);
+                    var quotaInfo = AsDictionary(Get(config, "quotaInfo"));
+                    double remainingFraction;
+                    if (quotaInfo == null || !TryDouble(Get(quotaInfo, "remainingFraction"), out remainingFraction)) continue;
+                    if (double.IsNaN(remainingFraction) || double.IsInfinity(remainingFraction) ||
+                        remainingFraction < 0d || remainingFraction > 1d)
+                    {
+                        continue;
+                    }
+
+                    var label = AsString(Get(config, "label")) ?? string.Empty;
+                    var modelAlias = AsDictionary(Get(config, "modelOrAlias"));
+                    var modelId = AsString(Get(modelAlias, "model")) ?? string.Empty;
+                    var combinedName = label + " " + modelId;
+
+                    QuotaPoolKind pool;
+                    if (combinedName.IndexOf("gemini", StringComparison.OrdinalIgnoreCase) >= 0)
+                        pool = QuotaPoolKind.Gemini;
+                    else if (combinedName.IndexOf("claude", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                             combinedName.IndexOf("gpt", StringComparison.OrdinalIgnoreCase) >= 0)
+                        pool = QuotaPoolKind.ThirdParty;
+                    else
+                        continue;
+
+                    var untouchedFull = remainingFraction >= 1.0d;
+                    DateTimeOffset? reset = null;
+                    if (!untouchedFull)
+                    {
+                        var parsedReset = ParseTimestamp(Get(quotaInfo, "resetTime"));
+                        if (parsedReset != DateTimeOffset.MinValue) reset = parsedReset;
+                    }
+
+                    var candidate = new QuotaWindow
+                    {
+                        Pool = pool,
+                        Name = (pool == QuotaPoolKind.Gemini ? "Gemini" : "第三方") + " · 5h",
+                        Key = (pool == QuotaPoolKind.Gemini ? "gemini:300" : "thirdparty:300"),
+                        Kind = QuotaWindowKind.FiveHour,
+                        WindowMinutes = 300,
+                        UsedPercent = Math.Max(0d, Math.Min(100d, (1.0d - remainingFraction) * 100.0d)),
+                        ResetsAt = reset,
+                        IsUntouchedFull = untouchedFull
+                    };
+
+                    if (pool == QuotaPoolKind.Gemini)
+                    {
+                        if (gemini == null || candidate.UsedPercent > gemini.UsedPercent) gemini = candidate;
+                    }
+                    else
+                    {
+                        if (thirdParty == null || candidate.UsedPercent > thirdParty.UsedPercent) thirdParty = candidate;
+                    }
+                }
+
+                if (gemini == null && thirdParty == null) return false;
+                var parsed = new QuotaSnapshot { CapturedAt = DateTimeOffset.Now, LimitId = "antigravity" };
+                if (gemini != null) parsed.Windows.Add(gemini);
+                if (thirdParty != null) parsed.Windows.Add(thirdParty);
+                snapshot = parsed;
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static QuotaPoolKind ClassifyPool(string bucketId, string groupDisplayName)
+        {
+            if (!string.IsNullOrWhiteSpace(bucketId))
+            {
+                if (bucketId.StartsWith("gemini", StringComparison.OrdinalIgnoreCase)) return QuotaPoolKind.Gemini;
+                if (bucketId.StartsWith("3p", StringComparison.OrdinalIgnoreCase) ||
+                    bucketId.StartsWith("third", StringComparison.OrdinalIgnoreCase))
+                {
+                    return QuotaPoolKind.ThirdParty;
+                }
+            }
+
+            if (!string.IsNullOrWhiteSpace(groupDisplayName))
+            {
+                if (groupDisplayName.IndexOf("gemini", StringComparison.OrdinalIgnoreCase) >= 0)
+                    return QuotaPoolKind.Gemini;
+                if (groupDisplayName.IndexOf("claude", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    groupDisplayName.IndexOf("gpt", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    groupDisplayName.IndexOf("third", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    groupDisplayName.IndexOf("other", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    return QuotaPoolKind.ThirdParty;
+                }
+            }
+
+            return QuotaPoolKind.Default;
+        }
+
+        private static int ParseAntigravityWindowMinutes(string windowName, string bucketId)
+        {
+            if (string.Equals(windowName, "5h", StringComparison.OrdinalIgnoreCase) ||
+                (!string.IsNullOrEmpty(bucketId) && bucketId.EndsWith("-5h", StringComparison.OrdinalIgnoreCase)))
+            {
+                return 300;
+            }
+            if (string.Equals(windowName, "weekly", StringComparison.OrdinalIgnoreCase) ||
+                (!string.IsNullOrEmpty(bucketId) && bucketId.EndsWith("-weekly", StringComparison.OrdinalIgnoreCase)))
+            {
+                return 10080;
+            }
+            return 0;
+        }
+
+        internal static bool IsAntigravityLanguageServerExe(string exeName)
+        {
+            if (string.IsNullOrWhiteSpace(exeName)) return false;
+            var fileName = Path.GetFileName(exeName.Trim());
+            foreach (var known in LanguageServerExeNames)
+            {
+                if (string.Equals(fileName, known, StringComparison.OrdinalIgnoreCase)) return true;
+            }
+            return false;
+        }
+
+        internal static void SortLanguageServerCandidates(List<LanguageServerCandidate> candidates)
+        {
+            if (candidates == null) return;
+            // Prefer the global non-LSP language server over workspace-scoped LSP children, then lower PID.
+            candidates.Sort((a, b) =>
+            {
+                var lspCompare = a.EnableLsp.CompareTo(b.EnableLsp);
+                return lspCompare != 0 ? lspCompare : a.Pid.CompareTo(b.Pid);
+            });
+        }
+
+        internal static bool TryParseLanguageServerCommandLine(
+            string commandLine,
+            out string csrfToken,
+            out bool enableLsp)
+        {
+            csrfToken = null;
+            enableLsp = false;
+            if (string.IsNullOrWhiteSpace(commandLine)) return false;
+
+            var tokens = TokenizeCommandLine(commandLine);
+            if (tokens.Count == 0) return false;
+
+            string appDataDir = FindFlagValue(tokens, "--app_data_dir");
+            if (appDataDir != null)
+            {
+                var normalized = appDataDir.Trim().TrimEnd('\\', '/');
+                var leaf = Path.GetFileName(normalized);
+                if (string.IsNullOrEmpty(leaf)) leaf = normalized;
+                if (!string.Equals(leaf, "antigravity", StringComparison.OrdinalIgnoreCase) &&
+                    !leaf.StartsWith("antigravity-", StringComparison.OrdinalIgnoreCase) &&
+                    !leaf.StartsWith("antigravity_", StringComparison.OrdinalIgnoreCase))
+                {
+                    return false;
+                }
+            }
+            else
+            {
+                if (tokens[0].IndexOf("antigravity", StringComparison.OrdinalIgnoreCase) < 0)
+                {
+                    return false;
+                }
+            }
+
+            var csrf = FindFlagValue(tokens, "--csrf_token");
+            if (string.IsNullOrWhiteSpace(csrf) || csrf.Length < 16 || csrf.Length > 128) return false;
+            foreach (var ch in csrf)
+            {
+                if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'z') ||
+                      (ch >= 'A' && ch <= 'Z') || ch == '-' || ch == '_'))
+                {
+                    return false;
+                }
+            }
+
+            foreach (var token in tokens)
+            {
+                if (string.Equals(token, "--enable_lsp", StringComparison.Ordinal))
+                {
+                    enableLsp = true;
+                    break;
+                }
+                if (token.StartsWith("--enable_lsp=", StringComparison.Ordinal))
+                {
+                    var val = token.Substring("--enable_lsp=".Length);
+                    enableLsp = !string.Equals(val, "false", StringComparison.OrdinalIgnoreCase) && val != "0";
+                    break;
+                }
+            }
+
+            csrfToken = csrf;
+            return true;
+        }
+
+        private static string FindFlagValue(List<string> tokens, string flag)
+        {
+            var prefix = flag + "=";
+            for (int i = 0; i < tokens.Count; i++)
+            {
+                var token = tokens[i];
+                if (string.Equals(token, flag, StringComparison.Ordinal))
+                {
+                    return i + 1 < tokens.Count ? tokens[i + 1] : null;
+                }
+                if (token.StartsWith(prefix, StringComparison.Ordinal))
+                {
+                    return token.Substring(prefix.Length);
+                }
+            }
+            return null;
+        }
+
+        private static List<string> TokenizeCommandLine(string commandLine)
+        {
+            var result = new List<string>();
+            var current = new StringBuilder();
+            bool inQuotes = false;
+            bool hasToken = false;
+
+            for (int i = 0; i < commandLine.Length; i++)
+            {
+                char ch = commandLine[i];
+                if (ch == '"')
+                {
+                    inQuotes = !inQuotes;
+                    hasToken = true;
+                    continue;
+                }
+                if (!inQuotes && char.IsWhiteSpace(ch))
+                {
+                    if (hasToken)
+                    {
+                        result.Add(current.ToString());
+                        current.Clear();
+                        hasToken = false;
+                    }
+                    continue;
+                }
+                current.Append(ch);
+                hasToken = true;
+            }
+
+            if (hasToken) result.Add(current.ToString());
+            return result;
+        }
+
+        private static List<LanguageServerCandidate> DiscoverLanguageServers(out bool unreadableFound)
+        {
+            unreadableFound = false;
+            var candidates = new List<LanguageServerCandidate>();
+            if (!OperatingSystem.IsWindows()) return candidates;
+
+            var pids = EnumerateLanguageServerPids();
+            if (pids.Count == 0) return candidates;
+
+            var portsByPid = GetLoopbackListeningPortsByPid();
+            foreach (var pid in pids)
+            {
+                bool accessDenied;
+                var commandLine = TryReadProcessCommandLine(pid, out accessDenied);
+                if (string.IsNullOrWhiteSpace(commandLine))
+                {
+                    if (accessDenied) unreadableFound = true;
+                    continue;
+                }
+
+                string csrf;
+                bool enableLsp;
+                if (!TryParseLanguageServerCommandLine(commandLine, out csrf, out enableLsp)) continue;
+
+                List<ushort> ports;
+                if (!portsByPid.TryGetValue(pid, out ports)) ports = new List<ushort>();
+                candidates.Add(new LanguageServerCandidate
+                {
+                    Pid = pid,
+                    CsrfToken = csrf,
+                    EnableLsp = enableLsp,
+                    Ports = ports
+                });
+            }
+
+            return candidates;
+        }
+
+        private static List<uint> EnumerateLanguageServerPids()
+        {
+            var pids = new List<uint>();
+            IntPtr snapshot = IntPtr.Zero;
+            try
+            {
+                snapshot = CreateToolhelp32Snapshot(0x00000002u /* TH32CS_SNAPPROCESS */, 0);
+                if (snapshot == IntPtr.Zero || snapshot == new IntPtr(-1)) return pids;
+
+                var entry = new PROCESSENTRY32W { dwSize = (uint)Marshal.SizeOf<PROCESSENTRY32W>() };
+                if (Process32FirstW(snapshot, ref entry))
+                {
+                    do
+                    {
+                        if (IsAntigravityLanguageServerExe(entry.szExeFile))
+                        {
+                            pids.Add(entry.th32ProcessID);
+                        }
+                    }
+                    while (Process32NextW(snapshot, ref entry));
+                }
+            }
+            catch
+            {
+            }
+            finally
+            {
+                if (snapshot != IntPtr.Zero && snapshot != new IntPtr(-1)) CloseHandle(snapshot);
+            }
+            return pids;
+        }
+
+        private static string TryReadProcessCommandLine(uint pid, out bool accessDenied)
+        {
+            accessDenied = false;
+            IntPtr process = IntPtr.Zero;
+            try
+            {
+                process = OpenProcess(0x1000u /* PROCESS_QUERY_LIMITED_INFORMATION */, false, pid);
+                if (process == IntPtr.Zero)
+                {
+                    accessDenied = Marshal.GetLastWin32Error() == 5 /* ERROR_ACCESS_DENIED */;
+                    return null;
+                }
+
+                var direct = TryReadCommandLineViaNtInfo(process);
+                if (!string.IsNullOrEmpty(direct)) return direct;
+            }
+            catch
+            {
+            }
+            finally
+            {
+                if (process != IntPtr.Zero) CloseHandle(process);
+            }
+
+            if (IntPtr.Size != 8) return null;
+
+            IntPtr vmProcess = IntPtr.Zero;
+            try
+            {
+                vmProcess = OpenProcess(0x0400u | 0x0010u /* PROCESS_QUERY_INFORMATION | PROCESS_VM_READ */, false, pid);
+                if (vmProcess == IntPtr.Zero)
+                {
+                    if (Marshal.GetLastWin32Error() == 5) accessDenied = true;
+                    return null;
+                }
+                return TryReadCommandLineViaPeb64(vmProcess);
+            }
+            catch
+            {
+                return null;
+            }
+            finally
+            {
+                if (vmProcess != IntPtr.Zero) CloseHandle(vmProcess);
+            }
+        }
+
+        private static string TryReadCommandLineViaNtInfo(IntPtr process)
+        {
+            const int ProcessCommandLineInformation = 60;
+            uint needed = 0;
+            NtQueryInformationProcess(process, ProcessCommandLineInformation, IntPtr.Zero, 0, out needed);
+            if (needed == 0 || needed > MaximumCommandLineChars * 2 + 64) return null;
+
+            uint alloc = needed + 64;
+            IntPtr buffer = Marshal.AllocHGlobal((int)alloc);
+            try
+            {
+                uint written;
+                int status = NtQueryInformationProcess(process, ProcessCommandLineInformation, buffer, alloc, out written);
+                if (status != 0) return null;
+
+                int byteLength = (ushort)Marshal.ReadInt16(buffer, 0);
+                if (byteLength <= 0 || byteLength > MaximumCommandLineChars * 2) return null;
+                IntPtr stringPtr = Marshal.ReadIntPtr(buffer, IntPtr.Size);
+                if (stringPtr == IntPtr.Zero) return null;
+                return Marshal.PtrToStringUni(stringPtr, byteLength / 2);
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buffer);
+            }
+        }
+
+        private static string TryReadCommandLineViaPeb64(IntPtr process)
+        {
+            IntPtr pbiBuffer = Marshal.AllocHGlobal(48);
+            try
+            {
+                uint written;
+                if (NtQueryInformationProcess(process, 0 /* ProcessBasicInformation */, pbiBuffer, 48, out written) != 0)
+                    return null;
+
+                IntPtr pebAddress = Marshal.ReadIntPtr(pbiBuffer, 8);
+                if (pebAddress == IntPtr.Zero) return null;
+
+                IntPtr processParameters;
+                if (!TryReadRemoteIntPtr(process, IntPtr.Add(pebAddress, 0x20), out processParameters) ||
+                    processParameters == IntPtr.Zero)
+                {
+                    return null;
+                }
+
+                byte[] unicodeHeader = new byte[16];
+                IntPtr bytesRead;
+                if (!ReadProcessMemory(process, IntPtr.Add(processParameters, 0x70), unicodeHeader, (IntPtr)16, out bytesRead) ||
+                    bytesRead.ToInt64() < 16)
+                {
+                    return null;
+                }
+
+                int byteLength = BitConverter.ToUInt16(unicodeHeader, 0);
+                if (byteLength <= 0 || byteLength > MaximumCommandLineChars * 2) return null;
+                IntPtr cmdBuffer = new IntPtr(BitConverter.ToInt64(unicodeHeader, 8));
+                if (cmdBuffer == IntPtr.Zero) return null;
+
+                byte[] rawChars = new byte[byteLength];
+                if (!ReadProcessMemory(process, cmdBuffer, rawChars, (IntPtr)byteLength, out bytesRead) ||
+                    bytesRead.ToInt64() < byteLength)
+                {
+                    return null;
+                }
+
+                return Encoding.Unicode.GetString(rawChars);
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(pbiBuffer);
+            }
+        }
+
+        private static bool TryReadRemoteIntPtr(IntPtr process, IntPtr address, out IntPtr value)
+        {
+            value = IntPtr.Zero;
+            byte[] bytes = new byte[8];
+            IntPtr read;
+            if (!ReadProcessMemory(process, address, bytes, (IntPtr)8, out read) || read.ToInt64() < 8) return false;
+            value = new IntPtr(BitConverter.ToInt64(bytes, 0));
+            return true;
+        }
+
+        private static Dictionary<uint, List<ushort>> GetLoopbackListeningPortsByPid()
+        {
+            var result = new Dictionary<uint, List<ushort>>();
+            int size = 0;
+            GetExtendedTcpTable(IntPtr.Zero, ref size, false, 2 /* AF_INET */, 3 /* TCP_TABLE_OWNER_PID_LISTENER */, 0);
+            if (size <= 0 || size > 16 * 1024 * 1024) return result;
+
+            int alloc = size + 4096;
+            IntPtr buffer = Marshal.AllocHGlobal(alloc);
+            try
+            {
+                if (GetExtendedTcpTable(buffer, ref alloc, false, 2, 3, 0) != 0) return result;
+                int entries = Marshal.ReadInt32(buffer, 0);
+                int maxEntries = Math.Max(0, (alloc - 4) / 24);
+                int count = Math.Min(entries, maxEntries);
+
+                for (int i = 0; i < count; i++)
+                {
+                    int row = 4 + i * 24;
+                    uint localAddr = unchecked((uint)Marshal.ReadInt32(buffer, row + 4));
+                    // Only loopback (127.0.0.1 = 0x0100007F in little-endian) or wildcard (0.0.0.0).
+                    if (localAddr != 0x0100007Fu && localAddr != 0u) continue;
+
+                    uint rawPort = unchecked((uint)Marshal.ReadInt32(buffer, row + 8));
+                    uint owningPid = unchecked((uint)Marshal.ReadInt32(buffer, row + 20));
+                    ushort port = (ushort)(((rawPort & 0xFFu) << 8) | ((rawPort >> 8) & 0xFFu));
+                    if (port == 0) continue;
+
+                    List<ushort> list;
+                    if (!result.TryGetValue(owningPid, out list))
+                    {
+                        list = new List<ushort>();
+                        result[owningPid] = list;
+                    }
+                    if (!list.Contains(port)) list.Add(port);
+                }
+
+                foreach (var pair in result)
+                {
+                    pair.Value.Sort();
+                }
+            }
+            catch
+            {
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buffer);
+            }
+
+            return result;
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct PROCESSENTRY32W
+        {
+            public uint dwSize;
+            public uint cntUsage;
+            public uint th32ProcessID;
+            public UIntPtr th32DefaultHeapID;
+            public uint th32ModuleID;
+            public uint cntThreads;
+            public uint th32ParentProcessID;
+            public int pcPriClassBase;
+            public uint dwFlags;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+            public string szExeFile;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr CreateToolhelp32Snapshot(uint dwFlags, uint th32ProcessID);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool Process32FirstW(IntPtr hSnapshot, ref PROCESSENTRY32W lppe);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool Process32NextW(IntPtr hSnapshot, ref PROCESSENTRY32W lppe);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, uint dwProcessId);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CloseHandle(IntPtr hObject);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool ReadProcessMemory(
+            IntPtr hProcess,
+            IntPtr lpBaseAddress,
+            [Out] byte[] lpBuffer,
+            IntPtr nSize,
+            out IntPtr lpNumberOfBytesRead);
+
+        [DllImport("ntdll.dll")]
+        private static extern int NtQueryInformationProcess(
+            IntPtr ProcessHandle,
+            int ProcessInformationClass,
+            IntPtr ProcessInformation,
+            uint ProcessInformationLength,
+            out uint ReturnLength);
+
+        [DllImport("iphlpapi.dll", SetLastError = true)]
+        private static extern uint GetExtendedTcpTable(
+            IntPtr pTcpTable,
+            ref int pdwSize,
+            bool bOrder,
+            int ulAf,
+            int TableClass,
+            uint Reserved);
 
         private List<QuotaUsageSample> GetCombinedQuotaHistory()
         {
@@ -184,614 +1027,13 @@ namespace CodexQuotaTray
             sample = new QuotaUsageSample
             {
                 CapturedAt = DateTimeOffset.FromUnixTimeSeconds(capturedAt),
-                WindowKey = parts[1],
                 WindowKind = (QuotaWindowKind)kind,
+                WindowKey = parts[1],
                 WindowMinutes = minutes,
                 RemainingPercent = remaining,
                 ResetsAt = resetsAt > 0 ? DateTimeOffset.FromUnixTimeSeconds(resetsAt) : (DateTimeOffset?)null
             };
             return true;
-        }
-
-        private List<TokenActivitySample> ReadActivity(string sessionsPath)
-        {
-            var now = DateTimeOffset.Now;
-            if (_activityCache != null && now < _activityCacheExpiresAt)
-            {
-                return new List<TokenActivitySample>(_activityCache);
-            }
-
-            var cutoffUtc = DateTime.UtcNow.AddDays(-31);
-            var activity = new List<TokenActivitySample>();
-            var activityTimeline = new List<TokenActivitySample>();
-            var quotaHistory = new List<QuotaUsageSample>();
-            var files = new DirectoryInfo(sessionsPath)
-                .EnumerateFiles("*.jsonl", SearchOption.AllDirectories)
-                .Where(file => file.LastWriteTimeUtc >= cutoffUtc)
-                .OrderByDescending(file => file.LastWriteTimeUtc)
-                .Take(MaximumActivityFiles);
-
-            foreach (var file in files)
-            {
-                try
-                {
-                    TokenActivitySample latest = null;
-                    foreach (var line in ReadTailLines(file.FullName))
-                    {
-                        TokenActivitySample candidate;
-                        if (TryParseTokenUsageLine(line, out candidate))
-                        {
-                            candidate.SourceKey = file.FullName;
-                            candidate.SourceStartedAt = new DateTimeOffset(file.CreationTimeUtc);
-                            if (candidate.CapturedAt.UtcDateTime >= cutoffUtc)
-                                activityTimeline.Add(candidate);
-                            if (latest == null || candidate.CapturedAt >= latest.CapturedAt)
-                                latest = candidate;
-                        }
-
-                        QuotaSnapshot quotaSnapshot;
-                        if (TryParseTokenCountLine(line, out quotaSnapshot))
-                        {
-                            foreach (var window in quotaSnapshot.Windows)
-                            {
-                                quotaHistory.Add(new QuotaUsageSample
-                                {
-                                    CapturedAt = quotaSnapshot.CapturedAt,
-                                    WindowKey = window.Key,
-                                    WindowKind = window.Kind,
-                                    WindowMinutes = window.WindowMinutes,
-                                    RemainingPercent = window.RemainingPercent,
-                                    ResetsAt = window.ResetsAt
-                                });
-                            }
-                        }
-                    }
-
-                    if (latest != null && latest.Tokens > 0 && latest.CapturedAt.UtcDateTime >= cutoffUtc)
-                    {
-                        activity.Add(latest);
-                    }
-                }
-                catch (IOException)
-                {
-                }
-                catch (UnauthorizedAccessException)
-                {
-                }
-            }
-
-            activity = activity.OrderBy(item => item.CapturedAt).ToList();
-            activityTimeline = activityTimeline.OrderBy(item => item.CapturedAt).ToList();
-            quotaHistory = quotaHistory
-                .GroupBy(item => new { item.CapturedAt, item.WindowKey, item.WindowMinutes })
-                .Select(group => group.Last())
-                .OrderBy(item => item.CapturedAt)
-                .ToList();
-            _activityCache = activity;
-            _activityTimelineCache = activityTimeline;
-            _quotaHistoryCache = quotaHistory;
-            _activityCacheExpiresAt = now.AddMinutes(5);
-            return new List<TokenActivitySample>(activity);
-        }
-
-        private static string ResolveCodexHome()
-        {
-            var configured = Environment.GetEnvironmentVariable("CODEX_HOME");
-            if (!string.IsNullOrWhiteSpace(configured))
-            {
-                return configured;
-            }
-
-            return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".codex");
-        }
-
-        private static string ResolveClaudeCredentialsPath()
-        {
-            var configured = Environment.GetEnvironmentVariable("CLAUDE_CONFIG_DIR");
-            var dir = string.IsNullOrWhiteSpace(configured)
-                ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".claude")
-                : configured;
-            return Path.Combine(dir, ".credentials.json");
-        }
-
-        private static bool IsClaudeLoggedIn()
-        {
-            return File.Exists(ResolveClaudeCredentialsPath());
-        }
-
-        private static readonly System.Net.Http.HttpClient HttpClient =
-            new System.Net.Http.HttpClient { Timeout = TimeSpan.FromSeconds(15) };
-
-        private const string ClaudeUserAgent = "claude-code/2.1.0";
-        private const string ClaudeOAuthClientId = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
-        private static readonly string[] ClaudeTokenEndpoints =
-        {
-            "https://platform.claude.com/v1/oauth/token",
-            "https://console.anthropic.com/v1/oauth/token"
-        };
-        private static readonly object CredentialsGate = new object();
-        internal const string AwaitingClaudeRenewalMessage = "令牌已过期，运行一次 claude -p \"hi\" 即可续期";
-        // A refresh token the endpoint rate-limited. It is not sent again: the tray waits for
-        // Claude Code to renew the login, which replaces this token in the credentials file.
-        private static string _rateLimitedRefreshToken;
-
-        private sealed class ClaudeCredentials
-        {
-            public string AccessToken;
-            public string RefreshToken;
-            public string Plan;
-            public DateTimeOffset? ExpiresAt;
-        }
-
-        private QuotaSnapshot ReadLatestFromClaudeApi(out string failure, out bool refreshed)
-        {
-            failure = null;
-            refreshed = false;
-            var path = ResolveClaudeCredentialsPath();
-            if (!File.Exists(path)) { failure = "尚未找到 Claude 登录凭据，请先运行 Claude Code 并登录"; return null; }
-            var credentials = ReadClaudeCredentials(path);
-            if (credentials == null) { failure = "无法读取 Claude 登录凭据"; return null; }
-            if (string.IsNullOrWhiteSpace(credentials.AccessToken)) { failure = "Claude 登录凭据中没有访问令牌"; return null; }
-
-            // The access token lasts about an hour and Claude Code only renews it while it runs,
-            // so renew it here as well instead of showing stale quota once it expires.
-            if (credentials.ExpiresAt.HasValue && credentials.ExpiresAt.Value <= DateTimeOffset.UtcNow.AddMinutes(1))
-            {
-                credentials = RefreshClaudeCredentials(path, credentials, out failure);
-                if (credentials == null) return null;
-                refreshed = true;
-            }
-
-            int status;
-            var snapshot = RequestClaudeUsage(credentials, out status, out failure);
-            if (snapshot != null || refreshed || (status != 401 && status != 403)) return snapshot;
-
-            // Rejected before the recorded expiry (revoked token or clock skew): renew once and retry.
-            string refreshFailure;
-            var renewed = RefreshClaudeCredentials(path, credentials, out refreshFailure);
-            if (renewed == null) { failure = refreshFailure; return null; }
-            refreshed = true;
-            return RequestClaudeUsage(renewed, out status, out failure);
-        }
-
-        private static QuotaSnapshot RequestClaudeUsage(ClaudeCredentials credentials, out int status, out string failure)
-        {
-            status = 0;
-            failure = null;
-            try
-            {
-                using (var request = new HttpRequestMessage(HttpMethod.Get, "https://api.anthropic.com/api/oauth/usage"))
-                {
-                    request.Headers.TryAddWithoutValidation("Authorization", "Bearer " + credentials.AccessToken);
-                    request.Headers.TryAddWithoutValidation("anthropic-beta", "oauth-2025-04-20");
-                    request.Headers.TryAddWithoutValidation("User-Agent", ClaudeUserAgent);
-                    var response = HttpClient.SendAsync(request).GetAwaiter().GetResult();
-                    var body = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
-                    status = (int)response.StatusCode;
-                    if (!response.IsSuccessStatusCode)
-                    {
-                        failure = status == 401 || status == 403
-                            ? "Claude 登录已失效，请在 Claude Code 中重新登录"
-                            : status == 429
-                                ? "Claude 额度接口限流，稍后会自动重试"
-                                : "Claude 额度接口返回错误 (" + status + ")";
-                        return null;
-                    }
-                    QuotaSnapshot snapshot;
-                    if (TryParseClaudeUsageResponse(body, credentials.Plan, out snapshot)) return snapshot;
-                    failure = "Claude 返回的额度数据无法识别";
-                    return null;
-                }
-            }
-            catch
-            {
-                failure = "无法连接 Claude 额度接口，稍后会自动重试";
-                return null;
-            }
-        }
-
-        private static ClaudeCredentials RefreshClaudeCredentials(string path, ClaudeCredentials current, out string failure)
-        {
-            failure = null;
-            lock (CredentialsGate)
-            {
-                // Claude Code may have renewed the file since it was read; its token then wins.
-                var latest = ReadClaudeCredentials(path);
-                if (latest != null && !string.IsNullOrWhiteSpace(latest.AccessToken) && latest.AccessToken != current.AccessToken &&
-                    (!latest.ExpiresAt.HasValue || latest.ExpiresAt.Value > DateTimeOffset.UtcNow.AddMinutes(1)))
-                    return latest;
-                var refreshToken = latest != null && !string.IsNullOrWhiteSpace(latest.RefreshToken) ? latest.RefreshToken : current.RefreshToken;
-                if (string.IsNullOrWhiteSpace(refreshToken)) { failure = "Claude 登录已过期，请在 Claude Code 中重新登录"; return null; }
-                if (refreshToken == _rateLimitedRefreshToken) { failure = AwaitingClaudeRenewalMessage; return null; }
-
-                var status = 0;
-                string body = null;
-                foreach (var endpoint in ClaudeTokenEndpoints)
-                {
-                    try
-                    {
-                        using (var request = new HttpRequestMessage(HttpMethod.Post, endpoint))
-                        {
-                            request.Headers.TryAddWithoutValidation("User-Agent", ClaudeUserAgent);
-                            var payload = new JsonObject
-                            {
-                                ["grant_type"] = "refresh_token",
-                                ["refresh_token"] = refreshToken,
-                                ["client_id"] = ClaudeOAuthClientId
-                            };
-                            request.Content = new StringContent(payload.ToJsonString(), Encoding.UTF8, "application/json");
-                            var response = HttpClient.SendAsync(request).GetAwaiter().GetResult();
-                            status = (int)response.StatusCode;
-                            body = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
-                        }
-                    }
-                    catch
-                    {
-                        status = 0;
-                        body = null;
-                    }
-                    // Only an unreachable or missing endpoint moves on; any other answer is final.
-                    if (status != 0 && status != 404) break;
-                }
-
-                if (status == 0) { failure = "无法连接 Claude 登录服务，稍后会自动重试"; return null; }
-                if (status == 429)
-                {
-                    _rateLimitedRefreshToken = refreshToken;
-                    failure = AwaitingClaudeRenewalMessage;
-                    return null;
-                }
-                if (status == 400 || status == 401 || status == 403) { failure = "Claude 登录已失效，请在 Claude Code 中重新登录"; return null; }
-                if (status < 200 || status >= 300) { failure = "刷新 Claude 登录失败 (" + status + ")"; return null; }
-
-                ClaudeCredentials renewed;
-                try
-                {
-                    var root = JsonNode.Parse(body);
-                    long expiresIn;
-                    renewed = new ClaudeCredentials
-                    {
-                        AccessToken = JsonString(root?["access_token"]),
-                        RefreshToken = JsonString(root?["refresh_token"]) ?? refreshToken,
-                        Plan = latest != null && latest.Plan != null ? latest.Plan : current.Plan,
-                        ExpiresAt = TryJsonLong(root?["expires_in"], out expiresIn) && expiresIn > 0
-                            ? DateTimeOffset.UtcNow.AddSeconds(expiresIn)
-                            : (DateTimeOffset?)null
-                    };
-                }
-                catch
-                {
-                    renewed = null;
-                }
-                if (renewed == null || string.IsNullOrWhiteSpace(renewed.AccessToken))
-                {
-                    failure = "刷新 Claude 登录时返回的数据无法识别";
-                    return null;
-                }
-
-                // The old refresh token is now spent, so Claude Code must get the new pair too.
-                WriteClaudeCredentials(path, renewed);
-                return renewed;
-            }
-        }
-
-        private static ClaudeCredentials ReadClaudeCredentials(string path)
-        {
-            try
-            {
-                var oauth = JsonNode.Parse(ReadSharedText(path))?["claudeAiOauth"];
-                if (oauth == null) return null;
-                long expiresAt;
-                return new ClaudeCredentials
-                {
-                    AccessToken = JsonString(oauth["accessToken"]),
-                    RefreshToken = JsonString(oauth["refreshToken"]),
-                    Plan = JsonString(oauth["subscriptionType"]),
-                    ExpiresAt = TryJsonLong(oauth["expiresAt"], out expiresAt)
-                        ? DateTimeOffset.FromUnixTimeMilliseconds(expiresAt)
-                        : (DateTimeOffset?)null
-                };
-            }
-            catch
-            {
-                return null;
-            }
-        }
-
-        private static bool WriteClaudeCredentials(string path, ClaudeCredentials credentials)
-        {
-            var temporaryPath = path + ".quotatray.tmp";
-            try
-            {
-                var root = JsonNode.Parse(ReadSharedText(path)) as JsonObject;
-                var oauth = root?["claudeAiOauth"] as JsonObject;
-                if (oauth == null) return false;
-                // Edit only the token fields so everything else Claude Code stores is kept.
-                oauth["accessToken"] = credentials.AccessToken;
-                oauth["refreshToken"] = credentials.RefreshToken;
-                if (credentials.ExpiresAt.HasValue) oauth["expiresAt"] = credentials.ExpiresAt.Value.ToUnixTimeMilliseconds();
-                File.WriteAllText(temporaryPath, root.ToJsonString(), new UTF8Encoding(false));
-                File.Move(temporaryPath, path, true);
-                return true;
-            }
-            catch
-            {
-                try { File.Delete(temporaryPath); } catch { }
-                return false;
-            }
-        }
-
-        private static string ReadSharedText(string path)
-        {
-            using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
-            using (var reader = new StreamReader(stream, Encoding.UTF8, true, 4096, false))
-            {
-                return reader.ReadToEnd();
-            }
-        }
-
-        private static string JsonString(JsonNode node)
-        {
-            string value;
-            return node is JsonValue json && json.TryGetValue(out value) ? value : null;
-        }
-
-        private static bool TryJsonLong(JsonNode node, out long value)
-        {
-            value = 0;
-            if (!(node is JsonValue json)) return false;
-            if (json.TryGetValue(out value)) return true;
-            double number;
-            if (!json.TryGetValue(out number)) return false;
-            value = (long)number;
-            return true;
-        }
-
-        internal static bool TryParseClaudeUsageResponse(string json, string planType, out QuotaSnapshot snapshot)
-        {
-            snapshot = null;
-            if (string.IsNullOrWhiteSpace(json)) return false;
-            try
-            {
-                var serializer = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
-                var root = serializer.DeserializeObject(json) as Dictionary<string, object>;
-                if (root == null) return false;
-                var parsed = new QuotaSnapshot { CapturedAt = DateTimeOffset.Now, LimitId = "claude", PlanType = planType };
-
-                var limits = Get(root, "limits") as System.Collections.IEnumerable;
-                if (limits != null && !(limits is string))
-                {
-                    foreach (var item in limits)
-                    {
-                        var limit = AsDictionary(item);
-                        var kind = AsString(Get(limit, "kind"));
-                        double percent;
-                        if (!TryDouble(Get(limit, "percent", "utilization"), out percent)) continue;
-                        if (kind == "session") AddClaudeWindow(parsed, 300, percent, Get(limit, "resets_at"));
-                        else if (kind == "weekly_all") AddClaudeWindow(parsed, 10080, percent, Get(limit, "resets_at"));
-                    }
-                }
-                if (parsed.Windows.Count == 0)
-                {
-                    AddClaudeFlat(parsed, AsDictionary(Get(root, "five_hour")), 300);
-                    AddClaudeFlat(parsed, AsDictionary(Get(root, "seven_day")), 10080);
-                }
-                if (parsed.Windows.Count == 0) return false;
-                snapshot = parsed;
-                return true;
-            }
-            catch
-            {
-                return false;
-            }
-        }
-
-        private static void AddClaudeFlat(QuotaSnapshot snapshot, Dictionary<string, object> source, int minutes)
-        {
-            double percent;
-            if (source == null || !TryDouble(Get(source, "utilization"), out percent)) return;
-            AddClaudeWindow(snapshot, minutes, percent, Get(source, "resets_at"));
-        }
-
-        private static void AddClaudeWindow(QuotaSnapshot snapshot, int minutes, double usedPercent, object resetsAt)
-        {
-            foreach (var existing in snapshot.Windows)
-            {
-                if (existing.WindowMinutes == minutes) return;
-            }
-            DateTimeOffset? reset = null;
-            var parsed = ParseTimestamp(resetsAt);
-            if (parsed != DateTimeOffset.MinValue) reset = parsed;
-            snapshot.Windows.Add(new QuotaWindow
-            {
-                Name = BuildWindowName("claude", minutes, minutes != 300),
-                Key = "claude:" + minutes,
-                Kind = ClassifyWindow(minutes),
-                UsedPercent = Math.Max(0, Math.Min(100, usedPercent)),
-                WindowMinutes = minutes,
-                ResetsAt = reset
-            });
-        }
-
-        private static bool IsCodexProcessRunning()
-        {
-            return HasProcess("ChatGPT") || HasProcess("codex");
-        }
-
-        private static bool HasProcess(string name)
-        {
-            Process[] processes = null;
-            try
-            {
-                processes = Process.GetProcessesByName(name);
-                return processes.Length > 0;
-            }
-            catch
-            {
-                return false;
-            }
-            finally
-            {
-                if (processes != null)
-                {
-                    foreach (var process in processes)
-                    {
-                        process.Dispose();
-                    }
-                }
-            }
-        }
-
-        private QuotaSnapshot ReadLatestFromAppServer()
-        {
-            try
-            {
-                var executable = ResolveCodexExecutable();
-                if (string.IsNullOrWhiteSpace(executable)) return null;
-
-                using (var process = new Process())
-                {
-                    process.StartInfo = new ProcessStartInfo
-                    {
-                        FileName = executable,
-                        Arguments = "app-server --stdio",
-                        UseShellExecute = false,
-                        CreateNoWindow = true,
-                        RedirectStandardInput = true,
-                        RedirectStandardOutput = true,
-                        RedirectStandardError = true
-                    };
-                    if (!process.Start()) return null;
-                    try
-                    {
-                        process.StandardError.ReadToEndAsync();
-                        process.StandardInput.AutoFlush = true;
-                        process.StandardInput.WriteLine("{\"id\":1,\"method\":\"initialize\",\"params\":{\"clientInfo\":{\"name\":\"codex-quota-tray\",\"version\":\"2.6.0\"},\"capabilities\":{}}}");
-                        if (ReadAppServerResponse(process, 1, 2500) == null) return null;
-
-                        process.StandardInput.WriteLine("{\"id\":2,\"method\":\"account/rateLimits/read\",\"params\":{\"excludeResetCreditDetails\":true,\"supportsLunaReserve\":true}}");
-                        var response = ReadAppServerResponse(process, 2, 4000);
-                        QuotaSnapshot snapshot;
-                        return TryParseAppServerRateLimitsResponse(response, out snapshot) ? snapshot : null;
-                    }
-                    finally
-                    {
-                        try { process.StandardInput.Close(); }
-                        catch { }
-                        try
-                        {
-                            if (!process.WaitForExit(300)) process.Kill();
-                        }
-                        catch { }
-                    }
-                }
-            }
-            catch
-            {
-                return null;
-            }
-        }
-
-        private static string ReadAppServerResponse(Process process, long expectedId, int timeoutMilliseconds)
-        {
-            var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMilliseconds);
-            while (!process.HasExited)
-            {
-                var remaining = (int)Math.Max(1, (deadline - DateTime.UtcNow).TotalMilliseconds);
-                if (remaining <= 1) return null;
-
-                var read = process.StandardOutput.ReadLineAsync();
-                if (!read.Wait(remaining)) return null;
-                var line = read.Result;
-                if (line == null) return null;
-
-                try
-                {
-                    var serializer = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
-                    var root = serializer.DeserializeObject(line) as Dictionary<string, object>;
-                    long id;
-                    if (TryLong(Get(root, "id"), out id) && id == expectedId) return line;
-                }
-                catch
-                {
-                }
-            }
-
-            return null;
-        }
-
-        private static string ResolveCodexExecutable()
-        {
-            Process[] processes = null;
-            try
-            {
-                processes = Process.GetProcessesByName("codex");
-                foreach (var process in processes)
-                {
-                    try
-                    {
-                        var path = process.MainModule == null ? null : process.MainModule.FileName;
-                        if (!string.IsNullOrWhiteSpace(path) && File.Exists(path)) return path;
-                    }
-                    catch
-                    {
-                    }
-                }
-            }
-            catch
-            {
-            }
-            finally
-            {
-                if (processes != null)
-                {
-                    foreach (var process in processes) process.Dispose();
-                }
-            }
-
-            try
-            {
-                var binRoot = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "OpenAI", "Codex", "bin");
-                if (Directory.Exists(binRoot))
-                {
-                    var candidate = new DirectoryInfo(binRoot)
-                        .EnumerateFiles("codex.exe", SearchOption.AllDirectories)
-                        .OrderByDescending(file => file.LastWriteTimeUtc)
-                        .FirstOrDefault();
-                    if (candidate != null) return candidate.FullName;
-                }
-            }
-            catch
-            {
-            }
-
-            return null;
-        }
-
-        private string ReadPlanTypeFromAuth()
-        {
-            try
-            {
-                var path = Path.Combine(_codexHome, "auth.json");
-                if (!File.Exists(path)) return null;
-
-                string json;
-                using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
-                using (var reader = new StreamReader(stream, Encoding.UTF8, true, 4096, false))
-                {
-                    json = reader.ReadToEnd();
-                }
-
-                var serializer = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
-                var root = serializer.DeserializeObject(json) as Dictionary<string, object>;
-                var tokens = AsDictionary(Get(root, "tokens"));
-                var idToken = AsString(Get(tokens, "id_token", "idToken")) ?? AsString(Get(root, "id_token", "idToken"));
-                return TryReadPlanTypeFromIdToken(idToken);
-            }
-            catch
-            {
-                return null;
-            }
         }
 
         internal static string TryReadPlanTypeFromIdToken(string idToken)
@@ -817,45 +1059,6 @@ namespace CodexQuotaTray
             catch
             {
                 return null;
-            }
-        }
-
-        private static QuotaSnapshot ReadLatestFromFile(string path)
-        {
-            QuotaSnapshot latest = null;
-            foreach (var line in ReadTailLines(path))
-            {
-                QuotaSnapshot candidate;
-                if (TryParseTokenCountLine(line, out candidate) &&
-                    (latest == null || candidate.CapturedAt > latest.CapturedAt))
-                {
-                    latest = candidate;
-                }
-            }
-
-            return latest;
-        }
-
-        private static IEnumerable<string> ReadTailLines(string path)
-        {
-            using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
-            {
-                var offset = Math.Max(0, stream.Length - TailBytes);
-                stream.Seek(offset, SeekOrigin.Begin);
-
-                using (var reader = new StreamReader(stream, Encoding.UTF8, true, 4096, false))
-                {
-                    if (offset > 0)
-                    {
-                        reader.ReadLine();
-                    }
-
-                    string line;
-                    while ((line = reader.ReadLine()) != null)
-                    {
-                        yield return line;
-                    }
-                }
             }
         }
 
@@ -1023,17 +1226,9 @@ namespace CodexQuotaTray
 
         private static void AddBucket(QuotaSnapshot snapshot, Dictionary<string, object> bucket, string fallbackName)
         {
-            if (bucket == null)
-            {
-                return;
-            }
-
+            if (bucket == null) return;
             var bucketName = AsString(Get(bucket, "limit_name", "limitName"));
-            if (string.IsNullOrWhiteSpace(bucketName))
-            {
-                bucketName = fallbackName;
-            }
-
+            if (string.IsNullOrWhiteSpace(bucketName)) bucketName = fallbackName;
             AddWindow(snapshot, AsDictionary(Get(bucket, "primary")), bucketName, false);
             AddWindow(snapshot, AsDictionary(Get(bucket, "secondary")), bucketName, true);
         }
@@ -1082,16 +1277,9 @@ namespace CodexQuotaTray
             string bucketName,
             bool secondary)
         {
-            if (source == null)
-            {
-                return;
-            }
-
+            if (source == null) return;
             double usedPercent;
-            if (!TryDouble(Get(source, "used_percent", "usedPercent"), out usedPercent))
-            {
-                return;
-            }
+            if (!TryDouble(Get(source, "used_percent", "usedPercent"), out usedPercent)) return;
 
             int windowMinutes;
             TryInt(Get(source, "window_minutes", "windowDurationMins"), out windowMinutes);
@@ -1117,26 +1305,11 @@ namespace CodexQuotaTray
         private static string BuildWindowName(string bucketName, int minutes, bool secondary)
         {
             string windowName;
-            if (minutes == 300)
-            {
-                windowName = "5小时额度";
-            }
-            else if (minutes >= 10080)
-            {
-                windowName = "每周额度";
-            }
-            else if (minutes >= 1440)
-            {
-                windowName = "长期额度";
-            }
-            else if (minutes > 0)
-            {
-                windowName = "短期额度";
-            }
-            else
-            {
-                windowName = secondary ? "次要额度" : "主要额度";
-            }
+            if (minutes == 300) windowName = "5小时额度";
+            else if (minutes >= 10080) windowName = "每周额度";
+            else if (minutes >= 1440) windowName = "长期额度";
+            else if (minutes > 0) windowName = "短期额度";
+            else windowName = secondary ? "次要额度" : "主要额度";
 
             if (!string.IsNullOrWhiteSpace(bucketName) &&
                 !string.Equals(bucketName, "codex", StringComparison.OrdinalIgnoreCase))
@@ -1156,20 +1329,12 @@ namespace CodexQuotaTray
 
         private static object Get(Dictionary<string, object> source, params string[] keys)
         {
-            if (source == null)
-            {
-                return null;
-            }
-
+            if (source == null) return null;
             foreach (var key in keys)
             {
                 object value;
-                if (source.TryGetValue(key, out value))
-                {
-                    return value;
-                }
+                if (source.TryGetValue(key, out value)) return value;
             }
-
             return null;
         }
 
@@ -1195,7 +1360,6 @@ namespace CodexQuotaTray
             {
                 return parsed;
             }
-
             return DateTimeOffset.MinValue;
         }
 

@@ -9,16 +9,16 @@
     <ImplicitUsings>disable</ImplicitUsings>
     <Nullable>disable</Nullable>
     <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
-    <Product>CodexQuotaTray</Product>
+    <Product>AntigravityQuotaTray</Product>
     <Company>SYD-Official</Company>
-    <Description>Windows taskbar and floating Codex quota display</Description>
+    <Description>Windows taskbar and floating Google Antigravity quota display</Description>
     <Copyright>Copyright © 2026 SYD-Official</Copyright>
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <ApplicationManifest>app.manifest</ApplicationManifest>
-    <ApplicationIcon>Assets\CodexQuotaTray.ico</ApplicationIcon>
-    <AssemblyName>CodexQuotaTray</AssemblyName>
+    <ApplicationIcon>Assets\AntigravityQuotaTray.ico</ApplicationIcon>
+    <AssemblyName>AntigravityQuotaTray</AssemblyName>
     <RootNamespace>CodexQuotaTray</RootNamespace>
-    <Version>3.0.2-preview</Version>
+    <Version>1.0.0</Version>
     <Platforms>AnyCPU;x64</Platforms>
     <PublishTrimmed>false</PublishTrimmed>
     <DebugType>embedded</DebugType>

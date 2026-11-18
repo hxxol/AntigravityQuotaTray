@@ -1,7 +1,6 @@
 using System;
 using System.Drawing;
 using System.Globalization;
-using System.Linq;
 using System.Threading;
 using System.Windows.Forms;
 
@@ -27,6 +26,7 @@ namespace CodexQuotaTray
         private const int CurrentUiRecoveryVersion = 1;
         private const int RefreshIntervalMilliseconds = 60000;
         private const int MaximumRefreshIntervalMilliseconds = 600000;
+        private const int MaxNotifyIconTextLength = 127;
         private QuotaReadResult _lastResult;
         private QuotaSnapshot _lastGoodSnapshot;
         private string _lastError;
@@ -40,63 +40,67 @@ namespace CodexQuotaTray
         {
             try
             {
-            _settings = AppSettings.Load();
-            _widget = new TaskbarWidgetForm();
-            _widget.ApplySettings(_settings);
-            var dispatcherHandle = _widget.Handle;
-            _floating = new FloatingQuotaWindow(_settings);
-            _floating.PositionChanged += SaveSettings;
-            _settingsWindow = new SettingsWindow(_settings);
-            System.Windows.Forms.Integration.ElementHost.EnableModelessKeyboardInterop(_settingsWindow);
-            _settingsWindow.SettingsChanged += ApplySettingsChange;
-            _settingsWindow.ExitRequested += delegate { ExitThread(); };
+                _settings = AppSettings.Load();
+                _lastGoodSnapshot = _settings.LoadQuotaSnapshot();
+                if (_lastGoodSnapshot != null && !_settings.LastRemainingPercent.HasValue)
+                {
+                    _settings.LastRemainingPercent = _lastGoodSnapshot.DisplayRemainingPercent;
+                }
 
-            _menu = new ContextMenuStrip { ShowCheckMargin = true, ShowImageMargin = false };
-            _floatingItem = new ToolStripMenuItem(T("悬浮窗", "Floating window")) { Checked = _settings.FloatingVisible };
-            _floatingItem.Click += delegate { _settings.FloatingVisible = !_settings.FloatingVisible; ApplySettingsChange(); };
-            _menu.Items.Add(_floatingItem);
-            _menu.Items.Add(T("设置", "Settings"), null, delegate { ShowSettings(); });
-            _menu.Items.Add(T("退出", "Exit"), null, delegate { ExitThread(); });
-            _widget.RingClick += delegate { AcknowledgeCompletion(); ShowMenu(); };
-            _menu.Opening += delegate { _floatingItem.Checked = _settings.FloatingVisible; _widget.SuppressZOrderRefresh = true; };
-            _menu.Closed += delegate { _widget.SuppressZOrderRefresh = false; };
-            _recoveryIcon = new NotifyIcon
-            {
-                Text = T("Codex 额度 · 点击打开设置", "Codex Quota · Click for settings"),
-                ContextMenuStrip = _menu
-            };
-            _recoveryIcon.MouseClick += delegate(object sender, MouseEventArgs args)
-            { if (args.Button == MouseButtons.Left) ShowSettings(); };
-            _widget.VisibleChanged += delegate { UpdateRecoveryAccess(); };
-            _wake = new WakeWindow(recoverUi => _widget.BeginInvoke(new Action(() => HandleWake(recoverUi))));
+                _widget = new TaskbarWidgetForm();
+                _widget.ApplySettings(_settings);
+                var dispatcherHandle = _widget.Handle;
+                _floating = new FloatingQuotaWindow(_settings);
+                _floating.PositionChanged += SaveSettings;
+                _settingsWindow = new SettingsWindow(_settings);
+                System.Windows.Forms.Integration.ElementHost.EnableModelessKeyboardInterop(_settingsWindow);
+                _settingsWindow.SettingsChanged += ApplySettingsChange;
+                _settingsWindow.ExitRequested += delegate { ExitThread(); };
 
-            _refreshTimer = new System.Windows.Forms.Timer { Interval = RefreshIntervalMilliseconds };
-            _refreshTimer.Tick += delegate { RefreshInBackground(); };
-            _refreshTimer.Start();
-            _widget.ResetTextProvider = BuildResetText;
-            _floating.ResetTextProvider = BuildResetText;
-            _tooltipTimer = new System.Windows.Forms.Timer { Interval = 1000 };
-            _tooltipTimer.Tick += delegate { _widget.RefreshResetTooltip(); _floating.RefreshResetTooltip(); UpdateRecoveryAccess(); };
-            _tooltipTimer.Start();
-            _notificationTimer = new System.Windows.Forms.Timer { Interval = CodexCompletionMonitor.IdleIntervalMilliseconds };
-            _notificationTimer.Tick += delegate { PollCompletion(); };
-            _flashTimer = new System.Windows.Forms.Timer { Interval = 600 };
-            _flashTimer.Tick += delegate { _flash = !_flash; ApplyVisualResult(_lastResult); };
-            if (_settings.CompletionReminderEnabled) { _completionMonitor.Enable(); _notificationTimer.Start(); }
+                _menu = new ContextMenuStrip { ShowCheckMargin = true, ShowImageMargin = false };
+                _floatingItem = new ToolStripMenuItem(T("悬浮窗", "Floating window")) { Checked = _settings.FloatingVisible };
+                _floatingItem.Click += delegate { _settings.FloatingVisible = !_settings.FloatingVisible; ApplySettingsChange(); };
+                _menu.Items.Add(_floatingItem);
+                _menu.Items.Add(T("设置", "Settings"), null, delegate { ShowSettings(); });
+                _menu.Items.Add(T("退出", "Exit"), null, delegate { ExitThread(); });
+                _widget.RingClick += delegate { AcknowledgeCompletion(); ShowMenu(); };
+                _menu.Opening += delegate { _floatingItem.Checked = _settings.FloatingVisible; _widget.SuppressZOrderRefresh = true; };
+                _menu.Closed += delegate { _widget.SuppressZOrderRefresh = false; };
+                _recoveryIcon = new NotifyIcon
+                {
+                    Text = T("Antigravity 额度 · 点击打开设置", "Antigravity Quota · Click for settings"),
+                    ContextMenuStrip = _menu
+                };
+                _recoveryIcon.MouseClick += delegate(object sender, MouseEventArgs args)
+                { if (args.Button == MouseButtons.Left) ShowSettings(); };
+                _widget.VisibleChanged += delegate { UpdateRecoveryAccess(); };
+                _wake = new WakeWindow(recoverUi => _widget.BeginInvoke(new Action(() => HandleWake(recoverUi))));
 
-            // Show persisted offline data immediately. The potentially slow app-server read never blocks startup.
-            ApplyVisualResult(null);
-            _widget.SetVisible(true);
-            ApplyFloatingVisibility();
-            UpdateRecoveryAccess();
-            // This repaired preview presents a reachable settings window once. Future starts
-            // remain quiet, and a second launch can always bring these settings back.
-            _widget.BeginInvoke(new Action(() =>
-            {
-                if (recover) RecoverUi();
-                if (openSettings || recover || _settings.UiRecoveryVersion < CurrentUiRecoveryVersion) ShowSettings();
-            }));
-            RefreshInBackground();
+                _refreshTimer = new System.Windows.Forms.Timer { Interval = RefreshIntervalMilliseconds };
+                _refreshTimer.Tick += delegate { RefreshInBackground(); };
+                _refreshTimer.Start();
+                _widget.ResetTextProvider = BuildResetText;
+                _floating.ResetTextProvider = BuildResetText;
+                _tooltipTimer = new System.Windows.Forms.Timer { Interval = 1000 };
+                _tooltipTimer.Tick += delegate { _widget.RefreshResetTooltip(); _floating.RefreshResetTooltip(); UpdateRecoveryAccess(); };
+                _tooltipTimer.Start();
+                _notificationTimer = new System.Windows.Forms.Timer { Interval = CodexCompletionMonitor.IdleIntervalMilliseconds };
+                _notificationTimer.Tick += delegate { PollCompletion(); };
+                _flashTimer = new System.Windows.Forms.Timer { Interval = 600 };
+                _flashTimer.Tick += delegate { _flash = !_flash; ApplyVisualResult(_lastResult); };
+                if (_settings.CompletionReminderEnabled) { _completionMonitor.Enable(); _notificationTimer.Start(); }
+
+                // Show persisted offline data immediately before the first background read completes.
+                ApplyVisualResult(null);
+                _widget.SetVisible(true);
+                ApplyFloatingVisibility();
+                UpdateRecoveryAccess();
+                _widget.BeginInvoke(new Action(() =>
+                {
+                    if (recover) RecoverUi();
+                    if (openSettings || recover || _settings.UiRecoveryVersion < CurrentUiRecoveryVersion) ShowSettings();
+                }));
+                RefreshInBackground();
             }
             catch
             {
@@ -159,48 +163,15 @@ namespace CodexQuotaTray
 
         private void UpdateTrayTooltip()
         {
-            var text = CenterWeeklyLine(BuildResetText());
-            // NotifyIcon rejects tooltips longer than 127 characters.
-            if (text.Length > 127) text = text.Substring(0, 127);
+            var snapshot = _lastResult != null && _lastResult.Snapshot != null ? _lastResult.Snapshot : _lastGoodSnapshot;
+            var text = QuotaTooltipFormatter.FormatNotifyIconTooltip(snapshot, _lastError, DateTimeOffset.Now, _settings.IsEnglish);
             if (_recoveryIcon.Text != text) _recoveryIcon.Text = text;
         }
 
         private string BuildResetText()
         {
             var snapshot = _lastResult != null && _lastResult.Snapshot != null ? _lastResult.Snapshot : _lastGoodSnapshot;
-            var weekly = snapshot == null ? null : snapshot.WeeklyWindow;
-            var text = (weekly == null ? "周额度：暂无数据" : "周额度：" + weekly.RemainingPercent.ToString(CultureInfo.InvariantCulture) + "%") + "\n" +
-                FormatTrayReset("5h额度", snapshot == null ? null : snapshot.FiveHourWindow) + "\n" +
-                FormatTrayReset("周额度", weekly);
-            if (_lastError == null) return text;
-            var header = _lastGoodSnapshot == null
-                ? "未能读取额度"
-                : "额度未更新，显示的是 " + _lastGoodSnapshot.CapturedAt.ToLocalTime().ToString("MM-dd HH:mm", CultureInfo.InvariantCulture) + " 的数据";
-            var reason = _lastError.Length > 40 ? _lastError.Substring(0, 40) + "…" : _lastError;
-            return header + "\n" + reason + "\n" + text;
-        }
-
-        // The native system-tray tooltip is left-aligned, so pad the weekly line with spaces to
-        // roughly center it over the longest line. The custom tooltips center every line themselves.
-        private static string CenterWeeklyLine(string text)
-        {
-            var lines = text.Split('\n');
-            var index = Array.FindIndex(lines, line => line.StartsWith("周额度：", StringComparison.Ordinal) && !line.EndsWith("重置", StringComparison.Ordinal));
-            if (index < 0) return text;
-            // Measure in half-width units: CJK characters are about twice as wide as a space.
-            Func<string, int> width = line => line.Sum(ch => ch > 0x2E80 ? 2 : 1);
-            var widest = lines.Max(width);
-            var pad = (widest - width(lines[index])) / 2;
-            if (pad > 0) lines[index] = new string(' ', pad) + lines[index];
-            return string.Join("\n", lines);
-        }
-
-        private static string FormatTrayReset(string label, QuotaWindow window)
-        {
-            if (window == null || !window.ResetsAt.HasValue) return label + "：暂无数据";
-            var minutes = (long)Math.Ceiling((window.ResetsAt.Value - DateTimeOffset.Now).TotalMinutes);
-            if (minutes < 0) minutes = 0;
-            return label + "：" + (minutes / 1440) + "天" + (minutes / 60 % 24) + "时" + (minutes % 60) + "分后重置";
+            return QuotaTooltipFormatter.FormatQuotaTooltip(snapshot, _lastError, DateTimeOffset.Now, _settings.IsEnglish, false);
         }
 
         private void ShowSettings()
@@ -244,24 +215,27 @@ namespace CodexQuotaTray
                 }
                 try
                 {
-                    if (_exiting || _widget.IsDisposed || !_widget.IsHandleCreated) { Interlocked.Exchange(ref _refreshBusy, 0); return; }
-                    _widget.BeginInvoke(new Action(() =>
+                    if (!_exiting && !_widget.IsDisposed && _widget.IsHandleCreated)
                     {
-                        Interlocked.Exchange(ref _refreshBusy, 0);
-                        if (_exiting) return;
-                        _lastResult = result;
-                        TrackRefreshOutcome(result);
-                        ApplyVisualResult(result);
-                    }));
+                        _widget.BeginInvoke(new Action(() =>
+                        {
+                            if (_exiting) return;
+                            _lastResult = result;
+                            TrackRefreshOutcome(result);
+                            ApplyVisualResult(result);
+                        }));
+                    }
                 }
-                catch (InvalidOperationException) { Interlocked.Exchange(ref _refreshBusy, 0); }
+                catch (ObjectDisposedException) { }
+                catch (InvalidOperationException) { }
+                finally { Interlocked.Exchange(ref _refreshBusy, 0); }
             });
         }
 
-        // The usage endpoint is unofficial: poll it once a minute and back off to ten minutes while it fails.
+        // Poll the local language server once a minute; keep the normal pace when Antigravity is
+        // simply closed, and back off up to ten minutes only on unexpected protocol/read errors.
         private void TrackRefreshOutcome(QuotaReadResult result)
         {
-            if (result.TokenRefreshed) RuntimeLog.Event("quota.token-refreshed");
             if (result.Snapshot != null)
             {
                 _lastGoodSnapshot = result.Snapshot;
@@ -273,9 +247,7 @@ namespace CodexQuotaTray
             var error = string.IsNullOrWhiteSpace(result.Error) ? "读取额度时出现未知错误" : result.Error;
             if (error != _lastError) RuntimeLog.Event("quota.read-failed", "reason=" + error);
             _lastError = error;
-            // Waiting for Claude Code only re-reads the local credentials file, so keep the normal
-            // pace and pick up its renewed token within a minute.
-            _refreshTimer.Interval = result.AwaitingTokenRenewal
+            _refreshTimer.Interval = result.KeepNormalPollInterval
                 ? RefreshIntervalMilliseconds
                 : Math.Min(_refreshTimer.Interval * 2, MaximumRefreshIntervalMilliseconds);
         }
@@ -286,11 +258,15 @@ namespace CodexQuotaTray
             if (state.CacheChanged) SaveSettings();
             _widget.SetVisual(state.Remaining, state.Known, _hasUnread && _flash);
             _floating.SetVisual(state.Remaining, state.Known, _hasUnread && _flash);
-            // Keep the hover text available while reads fail, so the failure is visible there.
-            var resetWindow = state.ResetWindow ?? (_lastError == null ? null
-                : (_lastGoodSnapshot == null ? null : _lastGoodSnapshot.FiveHourWindow ?? _lastGoodSnapshot.WeeklyWindow) ?? new QuotaWindow());
+
+            var snapshot = (result != null ? result.Snapshot : null) ?? _lastGoodSnapshot;
+            var resetWindow = state.ResetWindow
+                ?? (snapshot != null
+                    ? (snapshot.GeminiFiveHourWindow ?? snapshot.ThirdPartyFiveHourWindow ?? snapshot.FiveHourWindow ?? snapshot.WeeklyWindow ?? new QuotaWindow())
+                    : (_lastError != null ? new QuotaWindow() : null));
             _widget.SetResetWindow(resetWindow);
             _floating.SetResetWindow(resetWindow);
+
             var previous = _recoveryImage;
             _recoveryImage = RingIconFactory.Create(state.Remaining, state.Known, ThemePalette.FromSettings(_settings), false, _settings);
             _recoveryIcon.Icon = _recoveryImage;

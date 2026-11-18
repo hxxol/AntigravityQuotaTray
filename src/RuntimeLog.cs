@@ -16,14 +16,14 @@ namespace CodexQuotaTray
         private static readonly object Gate = new object();
         private static readonly Encoding Utf8 = new UTF8Encoding(false);
         private static string _path;
-        internal static string LogPath => _path ?? @"%LOCALAPPDATA%\ClaudeMeter\logs\runtime.log";
+        internal static string LogPath => _path ?? @"%LOCALAPPDATA%\AntigravityMeter\logs\runtime.log";
 
         internal static void Start()
         {
             try
             {
                 var directory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                    "ClaudeMeter", "logs");
+                    "AntigravityMeter", "logs");
                 lock (Gate)
                 {
                     Directory.CreateDirectory(directory);

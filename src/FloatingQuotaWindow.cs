@@ -32,7 +32,7 @@ namespace CodexQuotaTray
         public FloatingQuotaWindow(AppSettings settings)
         {
             _settings = settings ?? throw new ArgumentNullException(nameof(settings));
-            Title = "Codex Quota";
+            Title = "Antigravity Quota";
             WindowStyle = WindowStyle.None;
             ResizeMode = ResizeMode.NoResize;
             AllowsTransparency = true;
@@ -86,7 +86,7 @@ namespace CodexQuotaTray
 
         public void RefreshResetTooltip()
         {
-            _tooltip?.SetText(_active && _resetWindow != null
+            _tooltip?.SetText(_resetWindow != null && (_active || ResetTextProvider != null)
                 ? (ResetTextProvider != null ? ResetTextProvider() : _resetWindow.FormatResetCountdown(DateTimeOffset.Now, _settings.IsEnglish))
                 : string.Empty);
         }

@@ -13,6 +13,9 @@ internal static class RegressionTests
     {
         JsonTypes();
         DisplayCache();
+        AntigravitySummaryAndCombinedMean();
+        AntigravityCommandLineAndCandidateOrdering();
+        AntigravityOfflineSnapshotPersistenceAndFourLineTooltip();
         SettingsRoundTrip();
         TaskbarGeometry();
         Console.WriteLine("New regression checks passed: " + _assertions);
@@ -69,6 +72,152 @@ internal static class RegressionTests
         snapshot.ReserveWindow = new QuotaWindow { UsedPercent = 15, WindowMinutes = 10080 };
         Assert(QuotaDisplayState.Update(offline, settings).Remaining == 90, "Reserve bucket must not replace the 5-hour display.");
         Assert(QuotaDisplayState.Update(new QuotaReadResult(), settings).Remaining == 90, "Failed refresh keeps cache.");
+    }
+    private static void AntigravitySummaryAndCombinedMean()
+    {
+        const string summaryJson = "{\"response\":{\"groups\":[" +
+            "{\"displayName\":\"Gemini Models\",\"buckets\":[" +
+            "{\"bucketId\":\"gemini-weekly\",\"window\":\"weekly\",\"remainingFraction\":0.72,\"resetTime\":\"2026-08-24T02:50:47Z\"}," +
+            "{\"bucketId\":\"gemini-5h\",\"window\":\"5h\",\"remainingFraction\":0.80,\"resetTime\":\"2026-08-21T18:06:34Z\"}]}," +
+            "{\"displayName\":\"Claude and GPT models\",\"buckets\":[" +
+            "{\"bucketId\":\"3p-weekly\",\"window\":\"weekly\",\"remainingFraction\":0.64,\"resetTime\":\"2026-08-28T13:06:34Z\"}," +
+            "{\"bucketId\":\"3p-5h\",\"window\":\"5h\",\"remainingFraction\":1,\"resetTime\":\"2026-08-21T18:06:34Z\"}]}]}}";
+
+        QuotaSnapshot snapshot;
+        Assert(SessionQuotaReader.TryParseAntigravityQuotaSummary(summaryJson, out snapshot), "Must parse RetrieveUserQuotaSummary response.");
+        Assert(snapshot.Windows.Count == 4 && snapshot.HasPoolWindows, "Must extract all four Gemini and third-party windows.");
+        Assert(snapshot.GeminiFiveHourWindow != null && snapshot.GeminiFiveHourWindow.RemainingPercent == 80, "Gemini 5h remaining must be 80%.");
+        Assert(snapshot.GeminiWeeklyWindow != null && snapshot.GeminiWeeklyWindow.RemainingPercent == 72, "Gemini weekly remaining must be 72%.");
+        Assert(snapshot.ThirdPartyFiveHourWindow != null && snapshot.ThirdPartyFiveHourWindow.RemainingPercent == 100, "Third-party 5h remaining must be 100%.");
+        Assert(snapshot.ThirdPartyFiveHourWindow.IsUntouchedFull && !snapshot.ThirdPartyFiveHourWindow.ResetsAt.HasValue,
+            "Untouched 100% bucket must drop sliding placeholder resetTime.");
+        Assert(snapshot.GeminiFiveHourWindow.ResetsAt.HasValue, "Partially used bucket must keep real resetTime.");
+        Assert(snapshot.ThirdPartyWeeklyWindow != null && snapshot.ThirdPartyWeeklyWindow.RemainingPercent == 64, "Third-party weekly remaining must be 64%.");
+        // (80% + 100%) / 2 = 90%
+        Assert(snapshot.DisplayRemainingPercent == 90, "Combined ring percentage must be the 0-100 mean of Gemini and third-party 5h pools.");
+
+        // Weekly-only plan fallback (e.g., Free tier without 5h buckets): (72 + 64) / 2 = 68%
+        const string weeklyOnlyJson = "{\"response\":{\"groups\":[" +
+            "{\"displayName\":\"Gemini Models\",\"buckets\":[{\"bucketId\":\"gemini-weekly\",\"window\":\"weekly\",\"remainingFraction\":0.72,\"resetTime\":\"2026-08-24T02:50:47Z\"}]}," +
+            "{\"displayName\":\"Third-party models\",\"buckets\":[{\"bucketId\":\"3p-weekly\",\"window\":\"weekly\",\"remainingFraction\":0.64,\"resetTime\":\"2026-08-28T13:06:34Z\"}]}]}}";
+        QuotaSnapshot weeklySnapshot;
+        Assert(SessionQuotaReader.TryParseAntigravityQuotaSummary(weeklyOnlyJson, out weeklySnapshot) &&
+            weeklySnapshot.DisplayRemainingPercent == 68, "Weekly-only plans must average the two weekly pools.");
+
+        // Legacy GetUserStatus fallback
+        const string userStatusJson = "{\"userStatus\":{\"cascadeModelConfigData\":{\"clientModelConfigs\":[" +
+            "{\"label\":\"Gemini 3 Pro\",\"quotaInfo\":{\"remainingFraction\":0.5,\"resetTime\":\"2026-08-21T18:06:34Z\"}}," +
+            "{\"label\":\"GPT-OSS\",\"quotaInfo\":{\"remainingFraction\":1.0,\"resetTime\":\"2026-08-21T18:06:34Z\"}}]}}}";
+        QuotaSnapshot fallbackSnapshot;
+        Assert(SessionQuotaReader.TryParseAntigravityUserStatusFallback(userStatusJson, out fallbackSnapshot) &&
+            fallbackSnapshot.DisplayRemainingPercent == 75, "GetUserStatus fallback must parse both pools and average 50% + 100% = 75%.");
+    }
+    private static void AntigravityCommandLineAndCandidateOrdering()
+    {
+        const string csrf = "11111111-2222-3333-4444-555555555555";
+        const string decoy = "99999999-8888-7777-6666-555555555555";
+        string token;
+        bool lsp;
+
+        Assert(SessionQuotaReader.IsAntigravityLanguageServerExe("language_server_windows_x64.exe") &&
+               SessionQuotaReader.IsAntigravityLanguageServerExe("LANGUAGE_SERVER_WINDOWS_ARM.EXE") &&
+               !SessionQuotaReader.IsAntigravityLanguageServerExe("explorer.exe"),
+               "Must match only Windows language server executables.");
+
+        Assert(SessionQuotaReader.TryParseLanguageServerCommandLine(
+            "\"C:\\Program Files\\Antigravity\\language_server_windows_x64.exe\" --extension_server_csrf_token " + decoy + " --csrf_token " + csrf + " --app_data_dir antigravity-ide",
+            out token, out lsp) && token == csrf && !lsp,
+            "Must extract --csrf_token rather than --extension_server_csrf_token.");
+
+        Assert(SessionQuotaReader.TryParseLanguageServerCommandLine(
+            "ls.exe --app_data_dir=\"C:\\Users\\lee\\.gemini\\antigravity\" --csrf_token=" + csrf + " --enable_lsp",
+            out token, out lsp) && token == csrf && lsp,
+            "Must accept full quoted Antigravity 2.0 app_data_dir paths and --enable_lsp.");
+
+        Assert(!SessionQuotaReader.TryParseLanguageServerCommandLine(
+            "ls.exe --app_data_dir windsurf --csrf_token " + csrf,
+            out token, out lsp),
+            "Must ignore non-Antigravity language servers.");
+
+        Assert(!SessionQuotaReader.TryParseLanguageServerCommandLine(
+            "ls.exe --app_data_dir antigravity --extension_server_csrf_token " + decoy,
+            out token, out lsp),
+            "Must reject command lines missing --csrf_token.");
+
+        var candidates = new List<LanguageServerCandidate>
+        {
+            new LanguageServerCandidate { Pid = 800, EnableLsp = true, CsrfToken = csrf },
+            new LanguageServerCandidate { Pid = 2400, EnableLsp = false, CsrfToken = csrf },
+            new LanguageServerCandidate { Pid = 1200, EnableLsp = false, CsrfToken = csrf }
+        };
+        SessionQuotaReader.SortLanguageServerCandidates(candidates);
+        Assert(candidates[0].Pid == 1200 && candidates[1].Pid == 2400 && candidates[2].Pid == 800,
+            "Global non-LSP language servers must be queried before workspace LSP servers.");
+    }
+    private static void AntigravityOfflineSnapshotPersistenceAndFourLineTooltip()
+    {
+        var now = DateTimeOffset.Parse("2026-11-18T15:00:00+08:00");
+        var snapshot = new QuotaSnapshot { CapturedAt = now.AddMinutes(-10), LimitId = "antigravity" };
+        snapshot.Windows.Add(new QuotaWindow
+        {
+            Pool = QuotaPoolKind.Gemini, Kind = QuotaWindowKind.FiveHour, WindowMinutes = 300,
+            UsedPercent = 15, ResetsAt = now.AddHours(3).AddMinutes(12)
+        });
+        snapshot.Windows.Add(new QuotaWindow
+        {
+            Pool = QuotaPoolKind.Gemini, Kind = QuotaWindowKind.Weekly, WindowMinutes = 10080,
+            UsedPercent = 28, ResetsAt = now.AddDays(4).AddHours(11).AddMinutes(5)
+        });
+        snapshot.Windows.Add(new QuotaWindow
+        {
+            Pool = QuotaPoolKind.ThirdParty, Kind = QuotaWindowKind.FiveHour, WindowMinutes = 300,
+            UsedPercent = 0, IsUntouchedFull = true
+        });
+        snapshot.Windows.Add(new QuotaWindow
+        {
+            Pool = QuotaPoolKind.ThirdParty, Kind = QuotaWindowKind.Weekly, WindowMinutes = 10080,
+            UsedPercent = 36, ResetsAt = now.AddDays(5).AddHours(8).AddMinutes(40)
+        });
+
+        var liveText = QuotaTooltipFormatter.FormatQuotaTooltip(snapshot, null, now, false, false);
+        var liveLines = liveText.Split('\n');
+        Assert(liveLines.Length == 4, "Live tooltip must have exactly 4 lines.");
+        Assert(liveLines[0] == "Gemini 5h：85% · 0天3时12分后重置", "Line 1 must format Gemini 5h.");
+        Assert(liveLines[1] == "Gemini 周：72% · 4天11时5分后重置", "Line 2 must format Gemini weekly.");
+        Assert(liveLines[2] == "第三方 5h：100% · 满额未计时", "Line 3 must format untouched third-party 5h.");
+        Assert(liveLines[3] == "第三方 周：64% · 5天8时40分后重置", "Line 4 must format third-party weekly.");
+
+        var notifyLive = QuotaTooltipFormatter.FormatNotifyIconTooltip(snapshot, null, now, false);
+        Assert(notifyLive.Length <= QuotaTooltipFormatter.MaxNotifyIconTextLength && notifyLive.Split('\n').Length == 4,
+            "Live NotifyIcon tooltip must fit within 127 chars and keep all 4 lines.");
+
+        var notifyOffline = QuotaTooltipFormatter.FormatNotifyIconTooltip(snapshot, SessionQuotaReader.NotRunningMessage, now, false);
+        Assert(notifyOffline.Length <= QuotaTooltipFormatter.MaxNotifyIconTextLength && notifyOffline.Split('\n').Length == 5,
+            "Offline NotifyIcon tooltip must fit within 127 chars and keep header + 4 pool lines.");
+
+        // Round-trip offline cache through settings.ini
+        var directory = Path.Combine(Path.GetTempPath(), "antigravity-cache-tests-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(directory);
+        var path = Path.Combine(directory, "settings.ini");
+        try
+        {
+            var settings = new AppSettings();
+            var state = QuotaDisplayState.Update(new QuotaReadResult { IsCodexRunning = true, Snapshot = snapshot }, settings);
+            // (85 + 100) / 2 = 92.5 -> 93
+            Assert(state.Known && state.Remaining == 93 && state.CacheChanged, "Live dual-pool update must store combined mean and snapshot.");
+            settings.Save(path);
+
+            var reloaded = AppSettings.Load(path);
+            var cachedSnapshot = reloaded.LoadQuotaSnapshot();
+            Assert(reloaded.LastRemainingPercent == 93 && cachedSnapshot != null && cachedSnapshot.Windows.Count == 4,
+                "Reloaded settings must restore both the ring percentage and all 4 cached windows when Antigravity is closed.");
+            Assert(cachedSnapshot.GeminiFiveHourWindow.RemainingPercent == 85 &&
+                   cachedSnapshot.GeminiWeeklyWindow.RemainingPercent == 72 &&
+                   cachedSnapshot.ThirdPartyFiveHourWindow.IsUntouchedFull &&
+                   cachedSnapshot.ThirdPartyWeeklyWindow.RemainingPercent == 64,
+                   "Restored offline snapshot must preserve each window's percentage and full flag.");
+        }
+        finally { Directory.Delete(directory, true); }
     }
     private static void SettingsRoundTrip()
     {

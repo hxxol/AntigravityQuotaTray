@@ -19,6 +19,8 @@ namespace CodexQuotaTray
     internal sealed class AppSettings
     {
         public int? LastRemainingPercent { get; set; }
+        public long? LastCapturedAtUnix { get; set; }
+        public string CachedQuotaWindows { get; set; }
         public int UiRecoveryVersion { get; set; }
         public bool FloatingVisible { get; set; }
         public int FloatingDiameter { get; set; }
@@ -69,6 +71,8 @@ namespace CodexQuotaTray
         public void Reset()
         {
             LastRemainingPercent = null;
+            LastCapturedAtUnix = null;
+            CachedQuotaWindows = null;
             UiRecoveryVersion = 0;
             FloatingVisible = false;
             FloatingDiameter = 256;
@@ -107,22 +111,30 @@ namespace CodexQuotaTray
             return Load(path);
         }
 
-        // Settings used to live in the original CodexQuotaTray folder, shared with that app.
-        // Copy the appearance once, but not its cached quota, which belongs to Codex.
+        // Copy visual preferences once from an existing sibling tray folder, without importing
+        // another provider's cached quota numbers.
         private static void ImportLegacySettings(string path)
         {
             try
             {
-                var legacyPath = Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                    "CodexMeter",
-                    "settings.ini");
-                if (!File.Exists(legacyPath)) return;
-                var lines = File.ReadAllLines(legacyPath)
-                    .Where(line => !line.TrimStart().StartsWith("LastRemainingPercent=", StringComparison.OrdinalIgnoreCase))
-                    .ToArray();
-                Directory.CreateDirectory(Path.GetDirectoryName(path));
-                File.WriteAllLines(path, lines);
+                var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+                foreach (var legacyFolder in new[] { "CodexMeter" })
+                {
+                    var legacyPath = Path.Combine(localAppData, legacyFolder, "settings.ini");
+                    if (!File.Exists(legacyPath)) continue;
+                    var lines = File.ReadAllLines(legacyPath)
+                        .Where(line =>
+                        {
+                            var trimmed = line.TrimStart();
+                            return !trimmed.StartsWith("LastRemainingPercent=", StringComparison.OrdinalIgnoreCase) &&
+                                   !trimmed.StartsWith("LastCapturedAtUnix=", StringComparison.OrdinalIgnoreCase) &&
+                                   !trimmed.StartsWith("CachedQuotaWindows=", StringComparison.OrdinalIgnoreCase);
+                        })
+                        .ToArray();
+                    Directory.CreateDirectory(Path.GetDirectoryName(path));
+                    File.WriteAllLines(path, lines);
+                    return;
+                }
             }
             catch
             {
@@ -165,6 +177,11 @@ namespace CodexQuotaTray
                 if (TryGet(values, "UiRecoveryVersion", out seconds) && seconds >= 0) settings.UiRecoveryVersion = seconds;
                 if (TryGet(values, "LastRemainingPercent", out seconds) && IsInRange(seconds, 0, 100))
                     settings.LastRemainingPercent = seconds;
+                long capturedUnix;
+                if (TryGetLong(values, "LastCapturedAtUnix", out capturedUnix) && capturedUnix > 0)
+                    settings.LastCapturedAtUnix = capturedUnix;
+                if (values.TryGetValue("CachedQuotaWindows", out text) && !string.IsNullOrWhiteSpace(text))
+                    settings.CachedQuotaWindows = text;
                 if (TryGet(values, "GlassOpacityPercent", out seconds) && IsInRange(seconds, 5, 95))
                     settings.GlassOpacityPercent = seconds;
 
@@ -200,6 +217,96 @@ namespace CodexQuotaTray
             return settings;
         }
 
+        internal bool SaveQuotaSnapshot(QuotaSnapshot snapshot)
+        {
+            if (snapshot == null || snapshot.Windows.Count == 0) return false;
+            var entries = new List<string>();
+            foreach (var window in snapshot.Windows)
+            {
+                if (window.Pool == QuotaPoolKind.Default) continue;
+                var poolCode = window.Pool == QuotaPoolKind.Gemini ? "gemini" : "thirdparty";
+                var resetUnix = window.ResetsAt.HasValue ? window.ResetsAt.Value.ToUnixTimeSeconds() : 0L;
+                var fullFlag = window.IsUntouchedFull ? "1" : "0";
+                entries.Add(string.Join(",", new[]
+                {
+                    poolCode,
+                    window.WindowMinutes.ToString(CultureInfo.InvariantCulture),
+                    window.UsedPercent.ToString("0.####", CultureInfo.InvariantCulture),
+                    resetUnix.ToString(CultureInfo.InvariantCulture),
+                    fullFlag
+                }));
+            }
+            if (entries.Count == 0) return false;
+
+            var encoded = string.Join("|", entries);
+            var capturedUnix = snapshot.CapturedAt > DateTimeOffset.MinValue
+                ? snapshot.CapturedAt.ToUnixTimeSeconds()
+                : DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            var contentChanged = !string.Equals(CachedQuotaWindows, encoded, StringComparison.Ordinal);
+            var timestampStale = !LastCapturedAtUnix.HasValue || Math.Abs(capturedUnix - LastCapturedAtUnix.Value) >= 300;
+            CachedQuotaWindows = encoded;
+            LastCapturedAtUnix = capturedUnix;
+            return contentChanged || timestampStale;
+        }
+
+        internal QuotaSnapshot LoadQuotaSnapshot()
+        {
+            if (string.IsNullOrWhiteSpace(CachedQuotaWindows)) return null;
+            try
+            {
+                var snapshot = new QuotaSnapshot
+                {
+                    CapturedAt = LastCapturedAtUnix.HasValue && LastCapturedAtUnix.Value > 0
+                        ? DateTimeOffset.FromUnixTimeSeconds(LastCapturedAtUnix.Value)
+                        : DateTimeOffset.MinValue,
+                    LimitId = "antigravity"
+                };
+
+                foreach (var rawEntry in CachedQuotaWindows.Split('|'))
+                {
+                    if (string.IsNullOrWhiteSpace(rawEntry)) continue;
+                    var parts = rawEntry.Split(',');
+                    int minutes;
+                    double used;
+                    long resetUnix;
+                    if (parts.Length < 5 ||
+                        !int.TryParse(parts[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out minutes) ||
+                        !double.TryParse(parts[2], NumberStyles.Float, CultureInfo.InvariantCulture, out used) ||
+                        !long.TryParse(parts[3], NumberStyles.Integer, CultureInfo.InvariantCulture, out resetUnix) ||
+                        minutes <= 0 || double.IsNaN(used) || double.IsInfinity(used))
+                    {
+                        continue;
+                    }
+
+                    var pool = string.Equals(parts[0], "gemini", StringComparison.OrdinalIgnoreCase)
+                        ? QuotaPoolKind.Gemini
+                        : string.Equals(parts[0], "thirdparty", StringComparison.OrdinalIgnoreCase)
+                            ? QuotaPoolKind.ThirdParty
+                            : QuotaPoolKind.Default;
+                    if (pool == QuotaPoolKind.Default) continue;
+
+                    var full = parts[4] == "1";
+                    snapshot.Windows.Add(new QuotaWindow
+                    {
+                        Pool = pool,
+                        Name = (pool == QuotaPoolKind.Gemini ? "Gemini" : "ThirdParty") + ":" + minutes,
+                        Key = (pool == QuotaPoolKind.Gemini ? "gemini:" : "thirdparty:") + minutes.ToString(CultureInfo.InvariantCulture),
+                        Kind = SessionQuotaReader.ClassifyWindow(minutes),
+                        WindowMinutes = minutes,
+                        UsedPercent = Math.Max(0d, Math.Min(100d, used)),
+                        ResetsAt = !full && resetUnix > 0 ? DateTimeOffset.FromUnixTimeSeconds(resetUnix) : (DateTimeOffset?)null,
+                        IsUntouchedFull = full
+                    });
+                }
+
+                return snapshot.Windows.Count > 0 ? snapshot : null;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
         public void Save()
         {
             Save(GetPath());
@@ -224,6 +331,8 @@ namespace CodexQuotaTray
                 "FloatingRingWidth=" + FloatingRingWidth.ToString(CultureInfo.InvariantCulture),
                 "FloatingRingScalePercent=" + FloatingRingScalePercent.ToString(CultureInfo.InvariantCulture),
                 "LastRemainingPercent=" + (LastRemainingPercent.HasValue ? LastRemainingPercent.Value.ToString(CultureInfo.InvariantCulture) : ""),
+                "LastCapturedAtUnix=" + (LastCapturedAtUnix.HasValue ? LastCapturedAtUnix.Value.ToString(CultureInfo.InvariantCulture) : ""),
+                "CachedQuotaWindows=" + (CachedQuotaWindows ?? ""),
                 "TrayRingWidth=" + TrayRingWidth.ToString(CultureInfo.InvariantCulture),
                 "TrayRingColor=" + TrayRingColor.ToArgb().ToString(CultureInfo.InvariantCulture),
                 "TrayFontColor=" + TrayFontColor.ToArgb().ToString(CultureInfo.InvariantCulture),
@@ -251,7 +360,7 @@ namespace CodexQuotaTray
         {
             return Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "ClaudeMeter",
+                "AntigravityMeter",
                 "settings.ini");
         }
 
@@ -267,6 +376,13 @@ namespace CodexQuotaTray
             string value;
             parsed = 0;
             return values.TryGetValue(key, out value) && int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out parsed);
+        }
+
+        private static bool TryGetLong(Dictionary<string, string> values, string key, out long parsed)
+        {
+            string value;
+            parsed = 0;
+            return values.TryGetValue(key, out value) && long.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out parsed);
         }
 
         private static bool IsInRange(int value, int minimum, int maximum)
@@ -289,6 +405,5 @@ namespace CodexQuotaTray
 
             return CultureInfo.InstalledUICulture.Name;
         }
-
     }
 }

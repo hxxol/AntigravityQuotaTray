@@ -10,14 +10,28 @@ namespace CodexQuotaTray
         Weekly
     }
 
+    internal enum QuotaPoolKind
+    {
+        Default = 0,
+        Gemini = 1,
+        ThirdParty = 2
+    }
+
     internal sealed class QuotaWindow
     {
         public string Name { get; set; }
         public string Key { get; set; }
+        public QuotaPoolKind Pool { get; set; }
         public QuotaWindowKind Kind { get; set; }
         public double UsedPercent { get; set; }
         public int WindowMinutes { get; set; }
         public DateTimeOffset? ResetsAt { get; set; }
+        public bool IsUntouchedFull { get; set; }
+
+        public double ExactRemainingPercent
+        {
+            get { return Math.Max(0d, Math.Min(100d, 100d - UsedPercent)); }
+        }
 
         internal string FormatResetCountdown(DateTimeOffset now, bool english)
         {
@@ -71,6 +85,86 @@ namespace CodexQuotaTray
         public QuotaWindow DisplayWeeklyWindow
         {
             get { return IsReserveActive ? ReserveWindow : WeeklyWindow; }
+        }
+
+        public bool HasPoolWindows
+        {
+            get
+            {
+                foreach (var window in Windows)
+                {
+                    if (window.Pool != QuotaPoolKind.Default) return true;
+                }
+                return false;
+            }
+        }
+
+        public QuotaWindow FindPoolWindow(QuotaPoolKind pool, QuotaWindowKind kind)
+        {
+            foreach (var window in Windows)
+            {
+                if (window.Pool == pool && window.Kind == kind) return window;
+            }
+            return null;
+        }
+
+        public QuotaWindow GeminiFiveHourWindow
+        {
+            get { return FindPoolWindow(QuotaPoolKind.Gemini, QuotaWindowKind.FiveHour); }
+        }
+
+        public QuotaWindow GeminiWeeklyWindow
+        {
+            get { return FindPoolWindow(QuotaPoolKind.Gemini, QuotaWindowKind.Weekly); }
+        }
+
+        public QuotaWindow ThirdPartyFiveHourWindow
+        {
+            get { return FindPoolWindow(QuotaPoolKind.ThirdParty, QuotaWindowKind.FiveHour); }
+        }
+
+        public QuotaWindow ThirdPartyWeeklyWindow
+        {
+            get { return FindPoolWindow(QuotaPoolKind.ThirdParty, QuotaWindowKind.Weekly); }
+        }
+
+        // Combined 0-100 display value: mean of Gemini and third-party 5h remaining percentages
+        // (falling back to weekly pools on weekly-only plans, or single-pool 5h for legacy fixtures).
+        public int DisplayRemainingPercent
+        {
+            get
+            {
+                if (HasPoolWindows)
+                {
+                    var gemini5h = GeminiFiveHourWindow;
+                    var third5h = ThirdPartyFiveHourWindow;
+                    if (gemini5h != null || third5h != null)
+                    {
+                        return AverageRemaining(gemini5h, third5h);
+                    }
+
+                    var geminiWeekly = GeminiWeeklyWindow;
+                    var thirdWeekly = ThirdPartyWeeklyWindow;
+                    if (geminiWeekly != null || thirdWeekly != null)
+                    {
+                        return AverageRemaining(geminiWeekly, thirdWeekly);
+                    }
+                }
+
+                var fiveHour = FiveHourWindow;
+                return fiveHour == null ? 0 : fiveHour.RemainingPercent;
+            }
+        }
+
+        private static int AverageRemaining(QuotaWindow first, QuotaWindow second)
+        {
+            double sum = 0d;
+            int count = 0;
+            if (first != null) { sum += first.ExactRemainingPercent; count++; }
+            if (second != null) { sum += second.ExactRemainingPercent; count++; }
+            if (count == 0) return 0;
+            var average = (int)Math.Round(sum / count, MidpointRounding.AwayFromZero);
+            return Math.Max(0, Math.Min(100, average));
         }
 
         public int MostConstrainedRemaining
@@ -204,7 +298,6 @@ namespace CodexQuotaTray
         public List<TokenActivitySample> ActivityTimeline { get; set; }
         public List<QuotaUsageSample> QuotaHistory { get; set; }
         public string Error { get; set; }
-        public bool TokenRefreshed { get; set; }
-        public bool AwaitingTokenRenewal { get; set; }
+        public bool KeepNormalPollInterval { get; set; }
     }
 }

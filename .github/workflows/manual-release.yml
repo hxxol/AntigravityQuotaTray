@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Release version, without v (for example 3.0.0)'
+        description: 'Release version, without v (for example 1.0.0)'
         required: true
-        default: '3.0.0'
+        default: '1.0.0'
         type: string
       publish_release:
         description: 'Publish a GitHub Release after every test and smoke check passes'
@@ -44,12 +44,12 @@ jobs:
           dotnet-version: '10.0.x'
       - name: Validate release version
         run: |
-          if ($env:RELEASE_VERSION -notmatch '^\d+\.\d+\.\d+$') { throw 'Version must be three numbers, such as 3.0.0.' }
+          if ($env:RELEASE_VERSION -notmatch '^\d+\.\d+\.\d+$') { throw 'Version must be three numbers, such as 1.0.0.' }
           $parts = $env:RELEASE_VERSION.Split('.') | ForEach-Object { [int]$_ }
           if (($parts | Where-Object { $_ -gt 65534 }).Count) { throw 'Version components must be at most 65534.' }
       - name: Build and run all Windows fixture and rendering tests
         run: |
-          dotnet run --project tests/CodexQuotaTray.Tests.csproj -c Release -- --fixtures-only
+          dotnet run --project tests/AntigravityQuotaTray.Tests.csproj -c Release -- --fixtures-only
           if ($LASTEXITCODE -ne 0) { throw 'Windows regression tests failed.' }
       - name: Publish, validate and smoke-test both single EXEs
         run: |
@@ -58,19 +58,19 @@ jobs:
           foreach ($mode in @('self-contained', 'framework-dependent')) {
             $selfContained = if ($mode -eq 'self-contained') { 'true' } else { 'false' }
             $out = Join-Path $PWD "dist/win-x64-$mode"
-            dotnet publish CodexQuotaTray.csproj -c Release -r win-x64 --self-contained $selfContained `
+            dotnet publish AntigravityQuotaTray.csproj -c Release -r win-x64 --self-contained $selfContained `
               -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true `
               "-p:EnableCompressionInSingleFile=$selfContained" -p:PublishTrimmed=false -p:DebugType=embedded `
               "-p:Version=$env:RELEASE_VERSION" "-p:AssemblyVersion=$env:RELEASE_VERSION.0" `
               "-p:FileVersion=$env:RELEASE_VERSION.0" -o $out
             if ($LASTEXITCODE -ne 0) { throw "Publish failed: $mode" }
             $files = @(Get-ChildItem $out -File)
-            if ($files.Count -ne 1 -or $files[0].Name -ne 'CodexQuotaTray.exe') { throw "Output was not a single EXE: $mode" }
+            if ($files.Count -ne 1 -or $files[0].Name -ne 'AntigravityQuotaTray.exe') { throw "Output was not a single EXE: $mode" }
             $process = Start-Process $files[0].FullName -ArgumentList '--smoke-test' -PassThru
             if (-not $process.WaitForExit(30000)) { $process.Kill(); Write-Warning "Smoke test timed out: $mode" }
             $process.Refresh()
             if ($process.ExitCode -ne 0) { Write-Warning "Smoke test exit $($process.ExitCode) for $mode (hosted runners have no interactive desktop); continuing." }
-            Copy-Item $files[0].FullName "release-assets/CodexQuotaTray-v$env:RELEASE_VERSION-win-x64-$mode.exe"
+            Copy-Item $files[0].FullName "release-assets/AntigravityQuotaTray-v$env:RELEASE_VERSION-win-x64-$mode.exe"
           }
           Get-ChildItem release-assets/*.exe | Sort-Object Name | ForEach-Object {
             "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant())  $($_.Name)"
@@ -88,7 +88,7 @@ jobs:
       - name: Upload build assets
         uses: actions/upload-artifact@v7
         with:
-          name: CodexQuotaTray-v${{ inputs.version }}-windows-x64
+          name: AntigravityQuotaTray-v${{ inputs.version }}-windows-x64
           path: release-assets/*
           if-no-files-found: error
           retention-days: 30
@@ -103,5 +103,5 @@ jobs:
           if ($LASTEXITCODE -eq 0) { throw "Release $tag already exists. Choose a new version; existing assets will not be overwritten." }
           $assets = @(Get-ChildItem release-assets/*.exe | ForEach-Object FullName)
           $assets += (Resolve-Path release-assets/SHA256SUMS.txt).Path
-          gh release create $tag @assets --target $env:GITHUB_SHA --title "ClaudeQuotaTray $tag · Preview" --prerelease --notes-file release-assets/RELEASE_NOTES.md
+          gh release create $tag @assets --target $env:GITHUB_SHA --title "AntigravityQuotaTray $tag · Preview" --prerelease --notes-file release-assets/RELEASE_NOTES.md
           if ($LASTEXITCODE -ne 0) { throw 'GitHub Release creation failed.' }

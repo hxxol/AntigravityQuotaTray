@@ -11,7 +11,7 @@
 
 ## 尚需在 Windows 上运行
 
-- `dotnet run --project tests/CodexQuotaTray.Tests.csproj -c Release -- --fixtures-only`
+- `dotnet run --project tests/AntigravityQuotaTray.Tests.csproj -c Release -- --fixtures-only`
 - `./tests/compare-legacy.ps1`：真实 .NET Framework 旧解析器与现代结果比较。
 - 两种发布 EXE 的 `--smoke-test`：创建/显示/隐藏/关闭真实 HWND 和原生 tooltip；验证三种像素尺寸。
 

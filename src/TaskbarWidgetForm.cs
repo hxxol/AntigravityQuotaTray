@@ -124,7 +124,7 @@ namespace CodexQuotaTray
         public void ApplyResult(QuotaReadResult result)
         {
             var snapshot = result == null ? null : result.Snapshot;
-            SetVisual(snapshot == null || snapshot.FiveHourWindow == null ? 0 : snapshot.FiveHourWindow.RemainingPercent,
+            SetVisual(snapshot == null ? 0 : snapshot.DisplayRemainingPercent,
                 result != null && result.IsCodexRunning && snapshot != null, false);
         }
 

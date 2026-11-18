@@ -27,15 +27,15 @@ namespace CodexQuotaTray
                 RuntimeLog.Start();
                 WaitForPreviousVersion(args);
                 bool recover = args.Contains("--recover");
-                using var mutex = new Mutex(true, "CodexQuotaTray.SingleInstance", out bool createdNew);
+                using var mutex = new Mutex(true, "AntigravityQuotaTray.SingleInstance", out bool createdNew);
                 if (!createdNew)
                 {
                     if (WakeWindow.Signal(recover)) return 0;
                     RuntimeLog.Event("app.existing-instance-no-acknowledgement");
                     MessageBox.Show(
-                        "已有版本正在运行，但没有响应设置请求。请先从旧版菜单退出；若无法操作，请在任务管理器中结束 CodexQuotaTray 后重新打开此 EXE。\n\n" +
-                        "Another version is already running and did not respond. Exit it first, or end CodexQuotaTray in Task Manager, then open this EXE again.",
-                        "Codex Quota", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                        "已有版本正在运行，但没有响应设置请求。请先从旧版菜单退出；若无法操作，请在任务管理器中结束 AntigravityQuotaTray 后重新打开此 EXE。\n\n" +
+                        "Another version is already running and did not respond. Exit it first, or end AntigravityQuotaTray in Task Manager, then open this EXE again.",
+                        "Antigravity Quota", MessageBoxButtons.OK, MessageBoxIcon.Information);
                     return 7;
                 }
                 wpf = new System.Windows.Application { ShutdownMode = System.Windows.ShutdownMode.OnExplicitShutdown };
@@ -51,8 +51,8 @@ namespace CodexQuotaTray
                 RuntimeLog.Exception("app.fatal", exception);
                 MessageBox.Show(
                     "程序遇到错误，已记录本地诊断信息。请重新打开 EXE；也可使用 --recover 参数恢复设置和悬浮窗。\n\n" +
-                    "Codex Quota encountered an error. Local diagnostics: " + RuntimeLog.LogPath,
-                    "Codex Quota", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    "Antigravity Quota encountered an error. Local diagnostics: " + RuntimeLog.LogPath,
+                    "Antigravity Quota", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return 1;
             }
             finally
@@ -71,9 +71,9 @@ namespace CodexQuotaTray
 
     internal sealed class WakeWindow : NativeWindow, IDisposable
     {
-        private const string WindowCaption = "CodexQuotaTray.MessageWindow";
-        private static readonly uint ControlMessage = RegisterWindowMessage("CodexQuotaTray.Control.v3.0.1");
-        private const int Acknowledgement = 0x435154;
+        private const string WindowCaption = "AntigravityQuotaTray.MessageWindow";
+        private static readonly uint ControlMessage = RegisterWindowMessage("AntigravityQuotaTray.Control.v1.0.0");
+        private const int Acknowledgement = 0x415154;
         private readonly Action<bool> _schedule;
         internal WakeWindow(Action<bool> schedule)
         {

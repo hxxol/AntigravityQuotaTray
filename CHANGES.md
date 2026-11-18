@@ -1,101 +1,28 @@
-# 修改说明（相对原版 CodexQuotaTray 3.0.2-preview）
+# 修改说明（AntigravityQuotaTray v1.0.0）
 
-本仓库由 [hxxol/CodexQuotaTray](https://github.com/hxxol/CodexQuotaTray) 改成 Claude 版。界面和逻辑尽量保持原样，只改了下面这些地方。当前最新版本：v1.0.6。
+本仓库基于原有 Windows 任务栏圆环与桌面悬浮窗框架改造为 **Google Antigravity** 额度显示工具，UI 形态、绘制参数与交互逻辑保持一致。
 
-## 1. 额度来源：Codex 改为 Claude
+## 1. 额度来源：本机 Google Antigravity 服务 + 离线快照缓存
 
-文件：`src/SessionQuotaReader.cs`
+文件：`src/SessionQuotaReader.cs`、`src/Models.cs`、`src/AppSettings.cs`
 
-- `ReadLatest()` 不再读取 Codex 本地会话日志和 `codex app-server`，改为调用 Claude 的 OAuth 用量接口。
-- 读取流程：
-  1. 从 `~/.claude/.credentials.json` 读取登录凭据（设置了环境变量 `CLAUDE_CONFIG_DIR` 时读该目录），取 `claudeAiOauth.accessToken` 和 `subscriptionType`。
-  2. 请求 `GET https://api.anthropic.com/api/oauth/usage`，请求头带 `Authorization: Bearer <token>` 和 `anthropic-beta: oauth-2025-04-20`。
-  3. 解析返回：优先读 `limits` 数组（`kind=session` 为 5 小时窗口，`kind=weekly_all` 为每周窗口，字段 `percent`、`resets_at`）；没有时读 `five_hour` / `seven_day`（字段 `utilization`、`resets_at`）。已用百分比映射为原程序使用的剩余额度。
-- 新增的方法：`ResolveClaudeCredentialsPath`、`IsClaudeLoggedIn`、`ReadLatestFromClaudeApi`、`TryParseClaudeUsageResponse` 等。原有的 Codex 解析代码保留，不再被调用。
-- 额度历史记录目录从 `CodexMeter` 改为 `ClaudeMeter`。
-- Claude 没有对应的 token 活动数据，这部分为空。
-- 没有凭据、token 过期、网络失败、返回无法识别时，会给出对应的错误提示（v1.0.4 起会显示在悬停提示里，见第 7 节）。
-- 注意：该接口是非官方接口，没有官方文档，以后可能变化。
+- 通过 Win32 API（`CreateToolhelp32Snapshot`、`NtQueryInformationProcess`、`GetExtendedTcpTable`）在当前用户会话下无感发现运行中的 `language_server_windows_x64.exe` / `language_server_windows_arm.exe` 进程，读取启动参数中的 `--csrf_token` 与本地监听端口（全程无子进程、无弹窗）。
+- 仅向本机回环地址 `127.0.0.1` 请求 `RetrieveUserQuotaSummary`（旧版本自动回退 `GetUserStatus`），解析 Google Antigravity 的两大额度池：
+  1. **Gemini 自有模型池**（`5h` 窗口 + `weekly` 周窗口）
+  2. **第三方模型池**（`5h` 窗口 + `weekly` 周窗口）
+- 当窗口处于 `100%` 满额未消耗状态时，自动忽略服务端返回的滑动占位 `resetTime`，标记为“满额未计时”。
+- **离线缓存持久化**：每次读取成功后将圆环综合均值及 4 个窗口的数据原子保存至 `%LOCALAPPDATA%\AntigravityMeter\settings.ini`。当 Google Antigravity 主程序未启动时，程序保持每 60 秒轻量检查一次，界面继续显示最后一次缓存的圆环数值与 4 行详情，并在主程序启动后 1 分钟内自动恢复实时更新。
 
-## 7. 登录令牌自动刷新、读取失败提示、刷新频率（v1.0.4）
+## 2. 圆环综合均值与 4 行悬停提示
 
-文件：`src/SessionQuotaReader.cs`、`src/TrayApplicationContext.cs`、`src/AppSettings.cs`、`src/RuntimeLog.cs`、`src/Models.cs`
+文件：`src/Models.cs`、`src/QuotaDisplayState.cs`、`src/TrayApplicationContext.cs`
 
-- 问题：v1.0.3 只读取 `accessToken`，不刷新。令牌约 8 小时过期，Claude Code 没在运行时不会续期，接口返回 401 后程序继续显示缓存的旧额度，看起来像额度没有变化。
-- 令牌自动刷新：
-  - 令牌到期前 1 分钟内，或接口返回 401/403 时，用凭据文件里的 `refreshToken` 请求 `POST https://platform.claude.com/v1/oauth/token`（连不上或 404 时改用 `https://console.anthropic.com/v1/oauth/token`），参数与 Claude Code 相同。
-  - 刷新成功后，把新的 `accessToken`、`refreshToken`、`expiresAt` 写回 `.credentials.json`，其他字段保持不变。旧的 `refreshToken` 刷新后会失效，必须写回，否则 Claude Code 会掉登录。
-  - 刷新前会重新读一次凭据文件：如果 Claude Code 已经续期，直接用它的新令牌，不再重复刷新。
-  - 刷新失败（`refreshToken` 失效、限流、网络错误）时给出对应提示，需要时在 Claude Code 里重新登录。
-- 读取失败提示：
-  - 读取失败时，悬停提示的前两行显示“额度未更新，显示的是 MM-dd HH:mm 的数据”和失败原因，下面仍是两行重置时间。原来失败时不显示任何提示。
-  - 日志记录 `quota.read-failed`（带原因，只在原因变化时记录一次）、`quota.read-recovered`、`quota.token-refreshed`。日志不包含令牌。
-- 刷新频率：额度接口从每 20 秒请求一次改为每 60 秒。连续失败时间隔逐次翻倍，最长 10 分钟；成功后恢复为 60 秒。悬停提示里的倒计时仍每秒更新。
-- 刷新被限流时等待官方续期（v1.0.5）：
-  - 令牌接口对本程序的刷新请求可能返回 429（限流）。v1.0.4 会在每次重试时再次请求，越重试越容易被限流。
-  - 现在某个 `refreshToken` 被限流后，程序不再用它请求刷新，只在每次轮询时重新读凭据文件，等 Claude Code 续期。Claude Code 续期后会换上新的 `refreshToken`，程序读到后自动恢复。
-  - 等待期间悬停提示显示“令牌已过期，运行一次 claude -p "hi" 即可续期”。运行任意一次 `claude` 命令即可续期，程序在 1 分钟内读到新令牌。
-  - 等待期间只读本地文件、不发网络请求，所以轮询间隔保持 60 秒，不翻倍。
-- 设置和日志目录：`settings.ini` 和 `logs\runtime.log` 从 `%LOCALAPPDATA%\CodexMeter` 改为 `%LOCALAPPDATA%\ClaudeMeter`，不再与原版 CodexQuotaTray 共用（原来两个程序会互相覆盖缓存的剩余额度）。首次启动时会复制原来的设置，但不复制缓存的剩余额度。
+- **圆环与中心数字**：折算为 `0–100` 综合百分比，取 `(Gemini 5h剩余% + 第三方 5h剩余%) / 2` 四舍五入（若套餐仅含周额度则自动按两池周额度求均值）。
+- **4 行悬停提示**：任务栏圆环、桌面悬浮窗与右下角系统托盘图标悬停时分 4 行显示 `Gemini 5h`、`Gemini 周`、`第三方 5h`、`第三方 周` 的剩余百分比与重置倒计时；针对 Windows `NotifyIcon.Text` 的 127 字符限制内置自适应紧凑排版，确保离线提示头与 4 行额度均不被截断。
 
-## 8. 圆环改为显示 5 小时额度，周额度移到悬停提示（v1.0.6）
+## 3. 独立命名与手动 Release 工作流
 
-文件：`src/QuotaDisplayState.cs`、`src/TaskbarWidgetForm.cs`、`src/TrayApplicationContext.cs`、`tests/RegressionTests.cs`
+文件：`AntigravityQuotaTray.csproj`、`src/Program.cs`、`src/RuntimeLog.cs`、`.github/workflows/manual-release.yml`、`build.ps1`
 
-- 任务栏圆环、系统托盘图标、悬浮窗的圆环和中间数字，原来显示剩余最少的窗口（通常是每周额度），现在固定显示 5 小时窗口的剩余额度。
-- 悬停提示在两行重置时间上方新增一行周额度剩余百分比，例如：
-  ```
-  周额度：72%
-  5h额度：X天X时X分后重置
-  周额度：X天X时X分后重置
-  ```
-  任务栏圆环和悬浮窗的提示框每行居中；系统托盘原生提示只能左对齐，用空格近似居中。
-- 升级后第一次读取成功前，圆环仍显示上一版缓存的数值（每周额度），读取成功后即变为 5 小时额度。
-
-## 2. 悬停提示改为两行
-
-文件：`src/TrayApplicationContext.cs`、`src/TaskbarWidgetForm.cs`、`src/FloatingQuotaWindow.cs`、`src/LegacyResetTooltip.cs`、新增 `src/TooltipText.cs`
-
-- 鼠标悬停在任务栏圆环和悬浮窗上时，提示显示两行，每秒更新：
-  ```
-  5h额度：X天X时X分后重置
-  周额度：X天X时X分后重置
-  ```
-  重置时间来自同一个用量接口的 `resets_at`。没有数据时对应那行显示“暂无数据”。
-- `TrayApplicationContext` 新增 `BuildResetText` 和 `FormatTrayReset` 生成文字，并通过新增的 `ResetTextProvider` 属性交给圆环窗口和悬浮窗。
-- 原来的提示框只能画单行文字。新增 `TooltipText`，按行测量和绘制，提示框的深色背景和样式不变。
-- 系统托盘（右下角“^”面板）里的图标现在一直显示，悬停同样是这两行文字。原来只有任务栏小组件不可用时才会出现。
-
-## 3. 程序图标
-
-文件：`Assets/CodexQuotaTray.ico`
-
-- 换成用户提供的图标，缩放为 16、20、24、32、40、48、64、96、128、256 共 10 个尺寸。小尺寸为自动缩小，可能不如专门绘制的清晰。
-
-## 4. 启动崩溃修复
-
-文件：`app.manifest`、`src/FloatingQuotaWindow.cs`
-
-- 现象：部分 Windows 11 环境下启动时报错，日志显示悬浮窗的提示框创建失败（`LegacyResetTooltip` 构造函数）。
-- 修改：
-  - 在 `app.manifest` 中声明使用 Common Controls v6（推测原因是缺少该声明，未在出错的电脑上单独验证）。
-  - 悬浮窗提示框创建失败时改为写日志（事件名 `floating.tooltip-unavailable`）并跳过，不再让程序退出。
-
-## 5. 构建与发布
-
-文件：`.github/workflows/manual-release.yml`
-
-- 仍然是手动触发的工作流，输入版本号并选择是否发布 Release。
-- 删除了“与原版 .NET Framework 解析器逐字对比”的步骤。该步骤要求读取额度的代码与原版完全一致，而本仓库已有意修改。
-- 交互式冒烟测试（`--smoke-test`）改为只警告、不中止。它需要真实桌面，在 GitHub 构建机上自包含版本的退出码为 1，原因未完全确认。请在真实桌面上自行运行验证。
-- Release 标题改为 `ClaudeQuotaTray v… · Preview`。
-
-## 6. 文档
-
-- `README.md` 顶部新增了本 fork 的简要说明，其余内容是原版文档。
-- 新增本文件 `CHANGES.md`。
-
-## 未修改的部分
-
-- exe 文件名、程序内文案、命名空间、设置窗口、悬浮窗和任务栏圆环的绘制、测试代码等均保持原样，仍显示 Codex 字样。
-- 提示框的深色背景没有改成透明：原生提示框不支持只让背景透明，强行实现效果差、风险大，所以没有做。
+- 单实例锁、唤醒消息窗口、配置与日志目录（`%LOCALAPPDATA%\AntigravityMeter`）全部独立，可与其他额度工具同时运行互不干扰。
+- 手动触发的 GitHub Actions 工作流输出 `AntigravityQuotaTray-vX.Y.Z-win-x64-self-contained.exe` 与 `AntigravityQuotaTray-vX.Y.Z-win-x64-framework-dependent.exe`。

@@ -47,7 +47,7 @@ namespace CodexQuotaTray
         public SettingsWindow(AppSettings settings)
         {
             _settings = settings ?? throw new ArgumentNullException(nameof(settings));
-            Title = T("Codex 额度 · 显示设置", "Codex Quota · Display settings");
+            Title = T("Antigravity 额度 · 显示设置", "Antigravity Quota · Display settings");
             Width = 1000;
             Height = 830;
             // Effective minima are reduced to fit the active monitor before the window is shown.
