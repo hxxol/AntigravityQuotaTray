@@ -245,7 +245,8 @@ namespace CodexQuotaTray
                 return;
             }
             var error = string.IsNullOrWhiteSpace(result.Error) ? "读取额度时出现未知错误" : result.Error;
-            if (error != _lastError) RuntimeLog.Event("quota.read-failed", "reason=" + error);
+            var logDetail = "reason=" + error + (string.IsNullOrWhiteSpace(result.Diagnostics) ? string.Empty : " " + result.Diagnostics);
+            if (error != _lastError) RuntimeLog.Event("quota.read-failed", logDetail);
             _lastError = error;
             _refreshTimer.Interval = result.KeepNormalPollInterval
                 ? RefreshIntervalMilliseconds

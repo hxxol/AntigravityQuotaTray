@@ -119,15 +119,36 @@ internal static class RegressionTests
         string token;
         bool lsp;
 
-        Assert(SessionQuotaReader.IsAntigravityLanguageServerExe("language_server_windows_x64.exe") &&
+        Assert(SessionQuotaReader.IsAntigravityLanguageServerExe("language_server.exe") &&
+               SessionQuotaReader.IsAntigravityLanguageServerExe("language_server_windows_x64.exe") &&
                SessionQuotaReader.IsAntigravityLanguageServerExe("LANGUAGE_SERVER_WINDOWS_ARM.EXE") &&
+               SessionQuotaReader.IsAntigravityLanguageServerExe("agy.exe") &&
                !SessionQuotaReader.IsAntigravityLanguageServerExe("explorer.exe"),
-               "Must match only Windows language server executables.");
+               "Must match Antigravity 2.0 language_server.exe, legacy language_server_windows_*.exe, and agy.exe.");
+
+        Assert(SessionQuotaReader.TryParseLanguageServerCommandLine(
+            "\"C:\\Users\\lee\\AppData\\Local\\Programs\\Antigravity\\resources\\bin\\language_server.exe\" --standalone --override_ide_name antigravity --https_server_port 0 --csrf_token " + csrf,
+            out token, out lsp) && token == csrf && !lsp,
+            "Must accept Antigravity 2.0 standalone language_server.exe command line without --app_data_dir.");
 
         Assert(SessionQuotaReader.TryParseLanguageServerCommandLine(
             "\"C:\\Program Files\\Antigravity\\language_server_windows_x64.exe\" --extension_server_csrf_token " + decoy + " --csrf_token " + csrf + " --app_data_dir antigravity-ide",
             out token, out lsp) && token == csrf && !lsp,
-            "Must extract --csrf_token rather than --extension_server_csrf_token.");
+            "Must extract --csrf_token rather than --extension_server_csrf_token when both are present.");
+
+        LanguageServerCandidate extOnlyCandidate;
+        Assert(SessionQuotaReader.TryParseCandidateCommandLine(
+            "language_server.exe",
+            "language_server.exe --extension_server_csrf_token " + decoy,
+            out extOnlyCandidate) && extOnlyCandidate.ExtensionCsrfToken == decoy,
+            "Must retain --extension_server_csrf_token as a fallback token.");
+
+        LanguageServerCandidate cliCandidate;
+        Assert(SessionQuotaReader.TryParseCandidateCommandLine(
+            "agy.exe",
+            "\"C:\\Users\\lee\\AppData\\Local\\agy\\bin\\agy.exe\"",
+            out cliCandidate) && cliCandidate.IsCliProcess,
+            "Must accept tokenless agy.exe CLI candidate.");
 
         Assert(SessionQuotaReader.TryParseLanguageServerCommandLine(
             "ls.exe --app_data_dir=\"C:\\Users\\lee\\.gemini\\antigravity\" --csrf_token=" + csrf + " --enable_lsp",
@@ -140,9 +161,21 @@ internal static class RegressionTests
             "Must ignore non-Antigravity language servers.");
 
         Assert(!SessionQuotaReader.TryParseLanguageServerCommandLine(
-            "ls.exe --app_data_dir antigravity --extension_server_csrf_token " + decoy,
+            "language_server.exe --standalone",
             out token, out lsp),
-            "Must reject command lines missing --csrf_token.");
+            "Must reject language_server command lines with no CSRF token.");
+
+        // Connect-ES protobuf oneof remaining format + Gemini 4 Argon extra group
+        const string oneofSummaryJson = "{\"summary\":{\"groups\":[" +
+            "{\"displayName\":\"Gemini 4 Argon\",\"buckets\":[{\"bucketId\":\"gemini-4-argon-5h\",\"window\":\"session\",\"remaining\":{\"case\":\"remainingFraction\",\"value\":0.2}}]}," +
+            "{\"displayName\":\"Gemini Pro\",\"buckets\":[{\"bucketId\":\"gemini-5h\",\"window\":\"session\",\"remaining\":{\"case\":\"remainingFraction\",\"value\":0.6}}]}," +
+            "{\"displayName\":\"Claude & GPT\",\"buckets\":[{\"bucketId\":\"claude-session\",\"window\":\"5-hour\",\"remaining\":{\"remainingFraction\":0.8}}]}]}}";
+        QuotaSnapshot oneofSnapshot;
+        Assert(SessionQuotaReader.TryParseAntigravityQuotaSummary(oneofSummaryJson, out oneofSnapshot) &&
+               oneofSnapshot.GeminiFiveHourWindow.RemainingPercent == 60 &&
+               oneofSnapshot.ThirdPartyFiveHourWindow.RemainingPercent == 80 &&
+               oneofSnapshot.DisplayRemainingPercent == 70,
+               "Must parse Connect-ES oneof remaining format and prefer ordinary gemini-5h bucket over specialized model buckets.");
 
         var candidates = new List<LanguageServerCandidate>
         {
@@ -153,6 +186,18 @@ internal static class RegressionTests
         SessionQuotaReader.SortLanguageServerCandidates(candidates);
         Assert(candidates[0].Pid == 1200 && candidates[1].Pid == 2400 && candidates[2].Pid == 800,
             "Global non-LSP language servers must be queried before workspace LSP servers.");
+
+        var procTree = new List<(uint Pid, uint ParentPid, string ExeName)>
+        {
+            (100, 4, "explorer.exe"),
+            (500, 100, "Antigravity.exe"),
+            (510, 500, "Antigravity.exe"),
+            (520, 510, "custom_sidecar.exe"),
+            (900, 100, "other_app.exe")
+        };
+        var treeSelected = SessionQuotaReader.SelectTargetProcesses(procTree, new HashSet<uint> { 520, 900 });
+        Assert(treeSelected.Count == 1 && treeSelected[0].Pid == 520 && treeSelected[0].IsAppDescendant,
+            "Listening descendants of Antigravity.exe must be discovered even if the sidecar binary name changes.");
     }
     private static void AntigravityOfflineSnapshotPersistenceAndFourLineTooltip()
     {
