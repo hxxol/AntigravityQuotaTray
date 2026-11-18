@@ -4,7 +4,7 @@ using System.Globalization;
 namespace CodexQuotaTray
 {
     // Extracted from the original TrayApplicationContext for characterization tests.
-    // The ring and number show the combined 0-100 mean across Gemini and third-party 5-hour pools.
+    // The ring and number show Gemini's 5-hour remaining quota.
     internal sealed class QuotaDisplayState
     {
         internal int Remaining;

@@ -93,16 +93,16 @@ internal static class RegressionTests
             "Untouched 100% bucket must drop sliding placeholder resetTime.");
         Assert(snapshot.GeminiFiveHourWindow.ResetsAt.HasValue, "Partially used bucket must keep real resetTime.");
         Assert(snapshot.ThirdPartyWeeklyWindow != null && snapshot.ThirdPartyWeeklyWindow.RemainingPercent == 64, "Third-party weekly remaining must be 64%.");
-        // (80% + 100%) / 2 = 90%
-        Assert(snapshot.DisplayRemainingPercent == 90, "Combined ring percentage must be the 0-100 mean of Gemini and third-party 5h pools.");
+        // Gemini 5h remaining = 80%
+        Assert(snapshot.DisplayRemainingPercent == 80, "Ring percentage must display Gemini 5h remaining quota directly.");
 
-        // Weekly-only plan fallback (e.g., Free tier without 5h buckets): (72 + 64) / 2 = 68%
+        // Weekly-only plan fallback (e.g., Free tier without 5h buckets): Gemini weekly = 72%
         const string weeklyOnlyJson = "{\"response\":{\"groups\":[" +
             "{\"displayName\":\"Gemini Models\",\"buckets\":[{\"bucketId\":\"gemini-weekly\",\"window\":\"weekly\",\"remainingFraction\":0.72,\"resetTime\":\"2026-08-24T02:50:47Z\"}]}," +
             "{\"displayName\":\"Third-party models\",\"buckets\":[{\"bucketId\":\"3p-weekly\",\"window\":\"weekly\",\"remainingFraction\":0.64,\"resetTime\":\"2026-08-28T13:06:34Z\"}]}]}}";
         QuotaSnapshot weeklySnapshot;
         Assert(SessionQuotaReader.TryParseAntigravityQuotaSummary(weeklyOnlyJson, out weeklySnapshot) &&
-            weeklySnapshot.DisplayRemainingPercent == 68, "Weekly-only plans must average the two weekly pools.");
+            weeklySnapshot.DisplayRemainingPercent == 72, "Weekly-only plans must fall back to Gemini weekly quota.");
 
         // Legacy GetUserStatus fallback
         const string userStatusJson = "{\"userStatus\":{\"cascadeModelConfigData\":{\"clientModelConfigs\":[" +
@@ -110,7 +110,7 @@ internal static class RegressionTests
             "{\"label\":\"GPT-OSS\",\"quotaInfo\":{\"remainingFraction\":1.0,\"resetTime\":\"2026-08-21T18:06:34Z\"}}]}}}";
         QuotaSnapshot fallbackSnapshot;
         Assert(SessionQuotaReader.TryParseAntigravityUserStatusFallback(userStatusJson, out fallbackSnapshot) &&
-            fallbackSnapshot.DisplayRemainingPercent == 75, "GetUserStatus fallback must parse both pools and average 50% + 100% = 75%.");
+            fallbackSnapshot.DisplayRemainingPercent == 50, "GetUserStatus fallback must display Gemini 5h quota (50%).");
     }
     private static void AntigravityCommandLineAndCandidateOrdering()
     {
@@ -174,7 +174,7 @@ internal static class RegressionTests
         Assert(SessionQuotaReader.TryParseAntigravityQuotaSummary(oneofSummaryJson, out oneofSnapshot) &&
                oneofSnapshot.GeminiFiveHourWindow.RemainingPercent == 60 &&
                oneofSnapshot.ThirdPartyFiveHourWindow.RemainingPercent == 80 &&
-               oneofSnapshot.DisplayRemainingPercent == 70,
+               oneofSnapshot.DisplayRemainingPercent == 60,
                "Must parse Connect-ES oneof remaining format and prefer ordinary gemini-5h bucket over specialized model buckets.");
 
         var candidates = new List<LanguageServerCandidate>
@@ -248,13 +248,13 @@ internal static class RegressionTests
         {
             var settings = new AppSettings();
             var state = QuotaDisplayState.Update(new QuotaReadResult { IsCodexRunning = true, Snapshot = snapshot }, settings);
-            // (85 + 100) / 2 = 92.5 -> 93
-            Assert(state.Known && state.Remaining == 93 && state.CacheChanged, "Live dual-pool update must store combined mean and snapshot.");
+            // Gemini 5h = 85%
+            Assert(state.Known && state.Remaining == 85 && state.CacheChanged, "Live dual-pool update must store Gemini 5h remaining and snapshot.");
             settings.Save(path);
 
             var reloaded = AppSettings.Load(path);
             var cachedSnapshot = reloaded.LoadQuotaSnapshot();
-            Assert(reloaded.LastRemainingPercent == 93 && cachedSnapshot != null && cachedSnapshot.Windows.Count == 4,
+            Assert(reloaded.LastRemainingPercent == 85 && cachedSnapshot != null && cachedSnapshot.Windows.Count == 4,
                 "Reloaded settings must restore both the ring percentage and all 4 cached windows when Antigravity is closed.");
             Assert(cachedSnapshot.GeminiFiveHourWindow.RemainingPercent == 85 &&
                    cachedSnapshot.GeminiWeeklyWindow.RemainingPercent == 72 &&

@@ -128,8 +128,8 @@ namespace CodexQuotaTray
             get { return FindPoolWindow(QuotaPoolKind.ThirdParty, QuotaWindowKind.Weekly); }
         }
 
-        // Combined 0-100 display value: mean of Gemini and third-party 5h remaining percentages
-        // (falling back to weekly pools on weekly-only plans, or single-pool 5h for legacy fixtures).
+        // Ring and number display Gemini's 5-hour remaining quota directly
+        // (falling back to Gemini weekly on weekly-only plans, or single-pool 5h for legacy fixtures).
         public int DisplayRemainingPercent
         {
             get
@@ -137,34 +137,15 @@ namespace CodexQuotaTray
                 if (HasPoolWindows)
                 {
                     var gemini5h = GeminiFiveHourWindow;
-                    var third5h = ThirdPartyFiveHourWindow;
-                    if (gemini5h != null || third5h != null)
-                    {
-                        return AverageRemaining(gemini5h, third5h);
-                    }
+                    if (gemini5h != null) return gemini5h.RemainingPercent;
 
                     var geminiWeekly = GeminiWeeklyWindow;
-                    var thirdWeekly = ThirdPartyWeeklyWindow;
-                    if (geminiWeekly != null || thirdWeekly != null)
-                    {
-                        return AverageRemaining(geminiWeekly, thirdWeekly);
-                    }
+                    return geminiWeekly != null ? geminiWeekly.RemainingPercent : 0;
                 }
 
                 var fiveHour = FiveHourWindow;
                 return fiveHour == null ? 0 : fiveHour.RemainingPercent;
             }
-        }
-
-        private static int AverageRemaining(QuotaWindow first, QuotaWindow second)
-        {
-            double sum = 0d;
-            int count = 0;
-            if (first != null) { sum += first.ExactRemainingPercent; count++; }
-            if (second != null) { sum += second.ExactRemainingPercent; count++; }
-            if (count == 0) return 0;
-            var average = (int)Math.Round(sum / count, MidpointRounding.AwayFromZero);
-            return Math.Max(0, Math.Min(100, average));
         }
 
         public int MostConstrainedRemaining

@@ -42,7 +42,7 @@ namespace CodexQuotaTray
             {
                 _settings = AppSettings.Load();
                 _lastGoodSnapshot = _settings.LoadQuotaSnapshot();
-                if (_lastGoodSnapshot != null && !_settings.LastRemainingPercent.HasValue)
+                if (_lastGoodSnapshot != null && (_lastGoodSnapshot.HasPoolWindows || !_settings.LastRemainingPercent.HasValue))
                 {
                     _settings.LastRemainingPercent = _lastGoodSnapshot.DisplayRemainingPercent;
                 }

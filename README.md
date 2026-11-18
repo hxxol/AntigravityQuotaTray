@@ -2,15 +2,15 @@
 
 面向 Windows x64 的 **Google Antigravity** 额度显示工具，保留原任务栏动态额度大圆环、WPF 桌面悬浮窗、系统托盘图标与全部交互/设置逻辑。
 
-- **圆环综合百分比（0–100）**：显示 Google Antigravity 自有 **Gemini 模型池**与**第三方模型池**的 5 小时窗口剩余均值 `(Gemini 5h + 第三方 5h) / 2`（仅周额度的套餐自动按两池周额度求均值）。
+- **圆环与数字（0–100）**：直接显示 Google Antigravity 官方 **Gemini 模型池的 5 小时剩余额度**（仅周额度的套餐自动显示 Gemini 周额度）。
 - **四行悬停提示**：鼠标悬停在任务栏圆环、悬浮窗或右下角系统托盘图标上时，分 4 行实时显示：
   1. `Gemini 5h` 剩余百分比与重置倒计时
   2. `Gemini 周` 剩余百分比与重置倒计时
   3. `第三方 5h` 剩余百分比与重置倒计时
   4. `第三方 周` 剩余百分比与重置倒计时
 - **纯本地回环读取 + 离线缓存**：
-  - 当 Google Antigravity 运行时，程序通过本机回环接口（`127.0.0.1` 的 `language_server_windows_*.exe` `RetrieveUserQuotaSummary`）每分钟读取最新额度，无需额外登录 Google OAuth，不向 Google 远端发送任何伪装请求。
-  - 当 Google Antigravity 未启动时，自动展示本地保存的最后一次额度快照（含圆环均值与全部 4 行详情），并在悬停提示顶部注明缓存时间；主程序启动后 1 分钟内自动恢复实时刷新。
+  - 当 Google Antigravity 运行时，程序通过本机回环接口（`127.0.0.1` 的 `language_server` / `language_server_windows_*.exe` `RetrieveUserQuotaSummary`）每分钟读取最新额度，无需额外登录 Google OAuth，不向 Google 远端发送任何伪装请求。
+  - 当 Google Antigravity 未启动时，自动展示本地保存的最后一次额度快照（含圆环数值与全部 4 行详情），并在悬停提示顶部注明缓存时间；主程序启动后 1 分钟内自动恢复实时刷新。
 
 ---
 
