@@ -39,20 +39,17 @@ namespace CodexQuotaTray
 
         private static readonly HttpClient LoopbackHttpClient = CreateLoopbackHttpClient();
 
-        private readonly string _codexHome;
         private readonly Func<bool> _processDetector;
         private readonly string _liveQuotaHistoryPath;
-        private List<QuotaUsageSample> _quotaHistoryCache;
         private List<QuotaUsageSample> _liveQuotaHistory;
 
         public SessionQuotaReader()
-            : this(null, null)
+            : this(null)
         {
         }
 
-        internal SessionQuotaReader(string codexHome, Func<bool> processDetector)
+        internal SessionQuotaReader(Func<bool> processDetector)
         {
-            _codexHome = codexHome;
             _processDetector = processDetector;
             _liveQuotaHistoryPath = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
@@ -919,8 +916,7 @@ namespace CodexQuotaTray
         {
             EnsureLiveQuotaHistoryLoaded();
             var cutoff = DateTimeOffset.Now.AddDays(-31);
-            return (_quotaHistoryCache ?? new List<QuotaUsageSample>())
-                .Concat(_liveQuotaHistory)
+            return _liveQuotaHistory
                 .Where(item => item.CapturedAt >= cutoff)
                 .GroupBy(item => new { item.CapturedAt, item.WindowKey, item.WindowMinutes })
                 .Select(group => group.Last())
